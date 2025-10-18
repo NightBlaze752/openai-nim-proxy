@@ -1,14 +1,8 @@
-// server.js — OpenAI -> NVIDIA NIM proxy
-// - Display reasoning only (wraps reasoning_content in <think>...</think>)
-// - DOES NOT send any "thinking mode" toggle to the model
-// - Streaming fix: emits a single well-formed think block
-// - Env vars:
-//   NIM_API_KEY                (required)
-//   SHOW_REASONING_MODELS      e.g. "deepseek,terminus,r1"
-//   MODEL_MAP_OVERRIDES        JSON string of alias->NIM model ids
-//   THINK_OPEN_TAG             default "<think>"
-//   THINK_CLOSE_TAG            default "</think>"
-//   NIM_API_BASE               default "https://integrate.api.nvidia.com/v1"
+// server-thinking.js — Same proxy, but sends thinking=true to models that support it.
+// WARNING: Only use if your platform/policy allows it. Some models may error.
+// Differences vs server.js:
+// - ENABLE_THINKING_MODE = true
+// - Adds extra_body: { chat_template_kwargs: { thinking: true } }
 
 const express = require('express');
 const cors = require('cors');
@@ -23,7 +17,7 @@ app.use(express.json({ limit: '2mb' }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY || '';
 
-const ENABLE_THINKING_MODE = false; // keep OFF
+const ENABLE_THINKING_MODE = true; // ON in this file
 
 const SHOW_REASONING_MODELS = (process.env.SHOW_REASONING_MODELS || '')
   .split(',')
@@ -39,7 +33,6 @@ function shouldShowReasoning(nimModelId) {
   return SHOW_REASONING_MODELS.some(token => id.includes(token));
 }
 
-// Defaults — you can override all of these with MODEL_MAP_OVERRIDES
 const DEFAULT_MODEL_MAPPING = {
   'gpt-4o': 'deepseek-ai/deepseek-v3.1',
   'gpt-4o-mini': 'deepseek-ai/deepseek-v3.1-terminus',
@@ -61,8 +54,8 @@ if (process.env.MODEL_MAP_OVERRIDES) {
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    service: 'OpenAI->NIM Proxy',
-    thinking_mode: 'DISABLED',
+    service: 'OpenAI->NIM Proxy (thinking)',
+    thinking_mode: 'ENABLED',
     show_reasoning_allowlist: SHOW_REASONING_MODELS,
     has_nim_key: !!NIM_API_KEY
   });
@@ -73,17 +66,14 @@ app.get('/v1/models', async (req, res) => {
     const r = await axios.get(`${NIM_API_BASE}/models`, {
       headers: { Authorization: `Bearer ${NIM_API_KEY}` }
     });
-
     const upstream = r.data?.data || r.data || [];
     const list = Array.isArray(upstream) ? upstream : upstream.data || [];
-
     const aliases = Object.keys(MODEL_MAPPING).map(id => ({
       id,
       object: 'model',
       created: Date.now(),
       owned_by: 'openai-nim-proxy-alias'
     }));
-
     res.json({ object: 'list', data: [...aliases, ...list] });
   } catch (error) {
     const status = error.response?.status || 500;
@@ -114,8 +104,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       messages,
       temperature: typeof temperature === 'number' ? temperature : 0.6,
       max_tokens: typeof max_tokens === 'number' ? max_tokens : 1024,
-      stream: !!stream
-      // No thinking mode here
+      stream: !!stream,
+      extra_body: { chat_template_kwargs: { thinking: true } } // key difference
     };
 
     const axiosConfig = {
@@ -127,7 +117,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, axiosConfig);
 
     if (response.status >= 400) {
-      // forward upstream 4xx as-is
       return res.status(response.status).json(response.data);
     }
 
@@ -171,7 +160,6 @@ app.post('/v1/chat/completions', async (req, res) => {
           const payload = line.slice(5).trim();
 
           if (payload === '[DONE]') {
-            // If we never emitted reasoning but collected some, emit now
             emitReasoningBlockIfNeeded();
             res.write('data: [DONE]\n\n');
             continue;
@@ -186,7 +174,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                 reasoningBuf += delta.reasoning_content;
                 delete delta.reasoning_content;
                 const onlyReasoning = !delta.content || delta.content.length === 0;
-                if (onlyReasoning) continue; // wait to emit until we have normal content
+                if (onlyReasoning) continue;
               }
               if (delta.content && !emittedReasoningBlock && reasoningBuf.length) {
                 emitReasoningBlockIfNeeded();
@@ -209,7 +197,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       return;
     }
 
-    // Non-streaming response: merge reasoning once at the top
+    // Non-streaming
     const openaiResponse = {
       id: `chatcmpl-${Date.now()}`,
       object: 'chat.completion',
@@ -251,8 +239,8 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`OpenAI->NIM Proxy running on port ${PORT}`);
+  console.log(`OpenAI->NIM Proxy (thinking) running on port ${PORT}`);
   console.log(`Health: http://localhost:${PORT}/health`);
-  console.log(`Thinking mode: DISABLED`);
+  console.log(`Thinking mode: ENABLED`);
   console.log(`Reasoning allowlist: ${SHOW_REASONING_MODELS.length ? SHOW_REASONING_MODELS.join(', ') : 'OFF'}`);
 });
