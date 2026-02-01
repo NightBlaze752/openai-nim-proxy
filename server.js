@@ -1,4 +1,22 @@
 // server.js — OpenAI -> NVIDIA NIM proxy (flex)
+// Fixes:
+//  - Prevents "Converting circular structure to JSON" when upstream errors during stream mode
+// Adds:
+//  - deepseek v3.2 alias support (and inherits v3.1 “thinking” config if you don’t specify it)
+//  - glm4.7 / glm-4.7 alias support
+//
+// Env vars (Render -> Environment):
+//   NIM_API_KEY                 required
+//   SHOW_REASONING_MODELS       e.g. "deepseek,terminus,r1,glm"
+//   MODEL_MAP_OVERRIDES         JSON: {"gpt-4o":"deepseek-ai/deepseek-v3.1", ...}
+//   REQUEST_MERGE_BY_MODEL      JSON: {"deepseek-ai/deepseek-v3.1":{...}, "glm-4.7":{...}}
+//   REQUEST_MERGE_GLOBAL        JSON
+//   EXTRA_BODY_BY_MODEL         JSON: {"deepseek-ai/deepseek-v3.1":{...}, "glm-4.7":{...}}
+//   EXTRA_BODY_GLOBAL           JSON
+//   THINK_OPEN_TAG              default "<think>"
+//   THINK_CLOSE_TAG             default "</think>"
+//   NIM_API_BASE                default "https://integrate.api.nvidia.com/v1"
+//   ENABLE_THINKING_MODE        "true"/"false" (default false) adds extra_body.chat_template_kwargs.thinking=true
 
 const express = require('express');
 const cors = require('cors');
@@ -58,18 +76,22 @@ function shouldShowReasoning(nimModelId) {
   return SHOW_REASONING_MODELS.some(token => id.includes(token));
 }
 
-// ---- Model mapping (added deepseek-v3.2 alias) ----
+// Defaults — override with MODEL_MAP_OVERRIDES
 const DEFAULT_MODEL_MAPPING = {
   'gpt-4o': 'deepseek-ai/deepseek-v3.1',
   'gpt-4o-mini': 'deepseek-ai/deepseek-v3.1-terminus',
   'gpt-4': 'deepseek-ai/deepseek-r1-0528',
   'gpt-3.5-turbo': 'meta/llama-3.1-8b-instruct',
 
-  // Added explicit aliases you can call directly:
+  // DeepSeek direct aliases
   'deepseek-v3.1': 'deepseek-ai/deepseek-v3.1',
-  'deepseek-v3.1-terminus': 'deepseek-ai/deepseek-v3.1-terminus',
   'deepseek-v3.2': 'deepseek-ai/deepseek-v3.2',
-  'deepseek-r1': 'deepseek-ai/deepseek-r1-0528'
+  'deepseek-v3.1-terminus': 'deepseek-ai/deepseek-v3.1-terminus',
+  'deepseek-r1': 'deepseek-ai/deepseek-r1-0528',
+
+  // GLM aliases (you said the NIM model id is exactly "glm-4.7")
+  'glm4.7': 'glm-4.7',
+  'glm-4.7': 'glm-4.7'
 };
 
 let MODEL_MAPPING = { ...DEFAULT_MODEL_MAPPING };
@@ -79,7 +101,7 @@ if (MODEL_MAP_OVERRIDES) {
   console.log('Loaded MODEL_MAP_OVERRIDES:', MODEL_MAPPING);
 }
 
-// ---- Reasoning extraction ----
+// Reasoning fields (provider variance)
 const REASONING_FIELDS = ['reasoning_content', 'reasoning', 'thoughts', 'thinking', 'chain_of_thought'];
 
 function extractReasoningFromDelta(delta) {
@@ -102,7 +124,7 @@ function extractReasoningFromMessage(msg) {
   return '';
 }
 
-// ---- Stream-safe upstream error handling (fixes circular JSON error) ----
+// ----- STREAM-SAFE upstream error forwarding (fixes circular JSON error) -----
 function isReadableStream(x) {
   return x && typeof x === 'object' && typeof x.on === 'function' && typeof x.pipe === 'function';
 }
@@ -150,7 +172,6 @@ async function sendUpstreamError(res, status, data, fallbackMessage = 'Upstream 
     }
 
     if (data && typeof data === 'object') {
-      // Assume already JSON-safe
       return res.status(status).json(data);
     }
 
@@ -164,17 +185,17 @@ async function sendUpstreamError(res, status, data, fallbackMessage = 'Upstream 
   }
 }
 
-// ---- Config fallback so v3.2 inherits v3.1 “thinking” settings automatically ----
+// Per-model config lookup with v3.2 inheriting v3.1 config if not explicitly provided
 function getPerModelConfig(map, nimModel) {
   if (!nimModel) return null;
   if (map[nimModel]) return map[nimModel];
 
-  // If you didn’t add v3.2 explicitly, inherit v3.1’s config:
+  // Inherit v3.1 config for v3.2 unless you override
   if (nimModel === 'deepseek-ai/deepseek-v3.2' && map['deepseek-ai/deepseek-v3.1']) {
     return map['deepseek-ai/deepseek-v3.1'];
   }
 
-  // Optional generic family key you can use in env:
+  // Optional “family key” you can use:
   // "deepseek-ai/deepseek-v3": { ... }
   if (nimModel.startsWith('deepseek-ai/deepseek-v3') && map['deepseek-ai/deepseek-v3']) {
     return map['deepseek-ai/deepseek-v3'];
@@ -189,13 +210,7 @@ app.get('/health', (req, res) => {
     service: 'OpenAI->NIM Proxy',
     thinking_mode: ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED',
     show_reasoning_allowlist: SHOW_REASONING_MODELS,
-    has_nim_key: !!NIM_API_KEY,
-    merges: {
-      request_global: Object.keys(REQUEST_MERGE_GLOBAL).length,
-      request_by_model: Object.keys(REQUEST_MERGE_BY_MODEL).length,
-      extra_body_global: Object.keys(EXTRA_BODY_GLOBAL).length,
-      extra_body_by_model: Object.keys(EXTRA_BODY_BY_MODEL).length
-    }
+    has_nim_key: !!NIM_API_KEY
   });
 });
 
@@ -249,13 +264,14 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: !!stream
     };
 
+    // Generic thinking hint
     if (ENABLE_THINKING_MODE) {
       nimRequest.extra_body = nimRequest.extra_body || {};
       nimRequest.extra_body.chat_template_kwargs = nimRequest.extra_body.chat_template_kwargs || {};
       nimRequest.extra_body.chat_template_kwargs.thinking = true;
     }
 
-    // Apply global and per-model top-level merges
+    // Top-level merges (vendor-specific; may be ignored/rejected by some models)
     if (REQUEST_MERGE_GLOBAL && Object.keys(REQUEST_MERGE_GLOBAL).length) {
       nimRequest = deepMerge(nimRequest, JSON.parse(JSON.stringify(REQUEST_MERGE_GLOBAL)));
     }
@@ -264,7 +280,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       nimRequest = deepMerge(nimRequest, JSON.parse(JSON.stringify(reqMergeForModel)));
     }
 
-    // Apply extra_body merges
+    // extra_body merges
     if (EXTRA_BODY_GLOBAL && Object.keys(EXTRA_BODY_GLOBAL).length) {
       nimRequest.extra_body = deepMerge(nimRequest.extra_body || {}, JSON.parse(JSON.stringify(EXTRA_BODY_GLOBAL)));
     }
@@ -276,18 +292,18 @@ app.post('/v1/chat/completions', async (req, res) => {
     const axiosConfig = {
       headers: { Authorization: `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
       responseType: stream ? 'stream' : 'json',
-      validateStatus: s => s < 600 // IMPORTANT: don't throw on 5xx; we handle >=400 below
+      validateStatus: s => s < 600
     };
 
     const upstream = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, axiosConfig);
 
     if (upstream.status >= 400) {
-      // IMPORTANT: upstream.data is a stream when responseType=stream
       return await sendUpstreamError(res, upstream.status, upstream.data, 'Upstream returned an error');
     }
 
     const showReasoning = shouldShowReasoning(nimModel);
 
+    // Streaming
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -349,7 +365,6 @@ app.post('/v1/chat/completions', async (req, res) => {
             for (const f of REASONING_FIELDS) if (f in delta) delete delta[f];
             emit(data);
           } catch {
-            // pass through raw line if it's not JSON
             res.write(line + '\n');
           }
         }
@@ -389,7 +404,6 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     res.json(openaiResponse);
   } catch (error) {
-    // If axios threw, try to forward upstream body safely too
     if (error.response) {
       const status = error.response.status || 500;
       return await sendUpstreamError(res, status, error.response.data, error.message || 'Upstream request failed');
