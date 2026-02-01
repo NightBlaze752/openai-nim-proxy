@@ -1,23 +1,3 @@
-// server.js — OpenAI -> NVIDIA NIM proxy (flex)
-// Fixes:
-//  - Prevents "Converting circular structure to JSON" when upstream errors during stream mode
-// Adds:
-//  - deepseek v3.2 alias support (and inherits v3.1 “thinking” config if you don’t specify it)
-//  - glm4.7 / glm-4.7 alias support
-//
-// Env vars (Render -> Environment):
-//   NIM_API_KEY                 required
-//   SHOW_REASONING_MODELS       e.g. "deepseek,terminus,r1,glm"
-//   MODEL_MAP_OVERRIDES         JSON: {"gpt-4o":"deepseek-ai/deepseek-v3.1", ...}
-//   REQUEST_MERGE_BY_MODEL      JSON: {"deepseek-ai/deepseek-v3.1":{...}, "glm-4.7":{...}}
-//   REQUEST_MERGE_GLOBAL        JSON
-//   EXTRA_BODY_BY_MODEL         JSON: {"deepseek-ai/deepseek-v3.1":{...}, "glm-4.7":{...}}
-//   EXTRA_BODY_GLOBAL           JSON
-//   THINK_OPEN_TAG              default "<think>"
-//   THINK_CLOSE_TAG             default "</think>"
-//   NIM_API_BASE                default "https://integrate.api.nvidia.com/v1"
-//   ENABLE_THINKING_MODE        "true"/"false" (default false) adds extra_body.chat_template_kwargs.thinking=true
-
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -76,6 +56,13 @@ function shouldShowReasoning(nimModelId) {
   return SHOW_REASONING_MODELS.some(token => id.includes(token));
 }
 
+// If true, we do NOT wrap reasoning in <think> for that model;
+// instead we stream it as normal content so UIs don’t hide it.
+function reasoningAsContentModel(nimModelId) {
+  const id = String(nimModelId || '').toLowerCase();
+  return id === 'z-ai/glm4.7' || id.includes('z-ai/glm4.7');
+}
+
 // Defaults — override with MODEL_MAP_OVERRIDES
 const DEFAULT_MODEL_MAPPING = {
   'gpt-4o': 'deepseek-ai/deepseek-v3.1',
@@ -83,15 +70,15 @@ const DEFAULT_MODEL_MAPPING = {
   'gpt-4': 'deepseek-ai/deepseek-r1-0528',
   'gpt-3.5-turbo': 'meta/llama-3.1-8b-instruct',
 
-  // DeepSeek direct aliases
+  // DeepSeek aliases
   'deepseek-v3.1': 'deepseek-ai/deepseek-v3.1',
   'deepseek-v3.2': 'deepseek-ai/deepseek-v3.2',
   'deepseek-v3.1-terminus': 'deepseek-ai/deepseek-v3.1-terminus',
   'deepseek-r1': 'deepseek-ai/deepseek-r1-0528',
 
-  // GLM aliases (you said the NIM model id is exactly "glm-4.7")
-  'glm4.7': 'glm-4.7',
-  'glm-4.7': 'glm-4.7'
+  // GLM aliases (correct id)
+  'glm4.7': 'z-ai/glm4.7',
+  'glm-4.7': 'z-ai/glm4.7'
 };
 
 let MODEL_MAPPING = { ...DEFAULT_MODEL_MAPPING };
@@ -101,7 +88,6 @@ if (MODEL_MAP_OVERRIDES) {
   console.log('Loaded MODEL_MAP_OVERRIDES:', MODEL_MAPPING);
 }
 
-// Reasoning fields (provider variance)
 const REASONING_FIELDS = ['reasoning_content', 'reasoning', 'thoughts', 'thinking', 'chain_of_thought'];
 
 function extractReasoningFromDelta(delta) {
@@ -155,9 +141,7 @@ async function sendUpstreamError(res, status, data, fallbackMessage = 'Upstream 
       try {
         return res.status(status).json(JSON.parse(text));
       } catch {
-        return res.status(status).json({
-          error: { message: text || fallbackMessage, type: 'upstream_error', code: status }
-        });
+        return res.status(status).json({ error: { message: text || fallbackMessage, type: 'upstream_error', code: status } });
       }
     }
 
@@ -165,9 +149,7 @@ async function sendUpstreamError(res, status, data, fallbackMessage = 'Upstream 
       try {
         return res.status(status).json(JSON.parse(data));
       } catch {
-        return res.status(status).json({
-          error: { message: data || fallbackMessage, type: 'upstream_error', code: status }
-        });
+        return res.status(status).json({ error: { message: data || fallbackMessage, type: 'upstream_error', code: status } });
       }
     }
 
@@ -175,13 +157,9 @@ async function sendUpstreamError(res, status, data, fallbackMessage = 'Upstream 
       return res.status(status).json(data);
     }
 
-    return res.status(status).json({
-      error: { message: fallbackMessage, type: 'upstream_error', code: status }
-    });
+    return res.status(status).json({ error: { message: fallbackMessage, type: 'upstream_error', code: status } });
   } catch (e) {
-    return res.status(500).json({
-      error: { message: e?.message || 'Failed to forward upstream error', type: 'proxy_error', code: 500 }
-    });
+    return res.status(500).json({ error: { message: e?.message || 'Failed to forward upstream error', type: 'proxy_error', code: 500 } });
   }
 }
 
@@ -190,13 +168,9 @@ function getPerModelConfig(map, nimModel) {
   if (!nimModel) return null;
   if (map[nimModel]) return map[nimModel];
 
-  // Inherit v3.1 config for v3.2 unless you override
   if (nimModel === 'deepseek-ai/deepseek-v3.2' && map['deepseek-ai/deepseek-v3.1']) {
     return map['deepseek-ai/deepseek-v3.1'];
   }
-
-  // Optional “family key” you can use:
-  // "deepseek-ai/deepseek-v3": { ... }
   if (nimModel.startsWith('deepseek-ai/deepseek-v3') && map['deepseek-ai/deepseek-v3']) {
     return map['deepseek-ai/deepseek-v3'];
   }
@@ -264,14 +238,14 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: !!stream
     };
 
-    // Generic thinking hint
+    // Global thinking hint (recommend leaving this false and using EXTRA_BODY_BY_MODEL instead)
     if (ENABLE_THINKING_MODE) {
       nimRequest.extra_body = nimRequest.extra_body || {};
       nimRequest.extra_body.chat_template_kwargs = nimRequest.extra_body.chat_template_kwargs || {};
       nimRequest.extra_body.chat_template_kwargs.thinking = true;
     }
 
-    // Top-level merges (vendor-specific; may be ignored/rejected by some models)
+    // Top-level merges
     if (REQUEST_MERGE_GLOBAL && Object.keys(REQUEST_MERGE_GLOBAL).length) {
       nimRequest = deepMerge(nimRequest, JSON.parse(JSON.stringify(REQUEST_MERGE_GLOBAL)));
     }
@@ -302,6 +276,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
     const showReasoning = shouldShowReasoning(nimModel);
+    const glmReasoningAsContent = showReasoning && reasoningAsContentModel(nimModel);
 
     // Streaming
     if (stream) {
@@ -318,7 +293,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         res.write(`data: ${JSON.stringify(obj)}\n\n`);
       }
       function emitReasoningBlockIfNeeded() {
-        if (!showReasoning || !reasoningBuf || emittedReasoningBlock) return;
+        if (!showReasoning || glmReasoningAsContent || !reasoningBuf || emittedReasoningBlock) return;
         const block = `${THINK_OPEN}\n${reasoningBuf}\n${THINK_CLOSE}\n\n`;
         const synthetic = {
           id: `chunk-${Date.now()}`,
@@ -353,11 +328,17 @@ app.post('/v1/chat/completions', async (req, res) => {
             if (showReasoning) {
               const r = extractReasoningFromDelta(delta);
               if (r) {
-                reasoningBuf += r;
-                const onlyReasoning = !delta.content || delta.content.length === 0;
-                if (onlyReasoning) continue;
+                if (glmReasoningAsContent) {
+                  // GLM fix: stream reasoning as normal text so UIs show it
+                  delta.content = (delta.content || '') + r;
+                } else {
+                  reasoningBuf += r;
+                  const onlyReasoning = !delta.content || delta.content.length === 0;
+                  if (onlyReasoning) continue;
+                }
               }
-              if (delta.content && !emittedReasoningBlock && reasoningBuf.length) {
+
+              if (!glmReasoningAsContent && delta.content && !emittedReasoningBlock && reasoningBuf.length) {
                 emitReasoningBlockIfNeeded();
               }
             }
@@ -390,7 +371,14 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         if (showReasoning) {
           const r = extractReasoningFromMessage(choice?.message);
-          if (r) content = `${THINK_OPEN}\n${r}\n${THINK_CLOSE}\n\n${content}`;
+          if (r) {
+            if (glmReasoningAsContent) {
+              // GLM fix: if content is empty, use reasoning as content (don’t wrap in <think>)
+              content = content || r;
+            } else {
+              content = `${THINK_OPEN}\n${r}\n${THINK_CLOSE}\n\n${content}`;
+            }
+          }
         }
 
         return {
@@ -408,7 +396,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       const status = error.response.status || 500;
       return await sendUpstreamError(res, status, error.response.data, error.message || 'Upstream request failed');
     }
-
     const safeMsg = error?.message || 'Internal server error';
     console.error('Proxy error:', { status: 500, message: safeMsg });
     res.status(500).json({ error: { message: safeMsg, type: 'invalid_request_error', code: 500 } });
