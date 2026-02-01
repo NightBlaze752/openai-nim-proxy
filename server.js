@@ -1,22 +1,4 @@
 // server.js — OpenAI -> NVIDIA NIM proxy (flex)
-// - Display reasoning for models that return it (wraps in <think>...</think>)
-// - Optional vendor hints via env to try to unlock reasoning on specific models
-// - Clean error handling + streaming fix + model aliases
-//
-// Env vars (Render -> Environment):
-//   NIM_API_KEY                 required
-//   SHOW_REASONING_MODELS       e.g. "deepseek,terminus,r1"
-//   MODEL_MAP_OVERRIDES         JSON: {"gpt-4o":"deepseek-ai/deepseek-v3.1", ...}
-//   // Optional reasoning attempts (top-level merge into request):
-//   REQUEST_MERGE_BY_MODEL      JSON: {"deepseek-ai/deepseek-v3.1":{"reasoning":{"effort":"medium"},"enable_reasoning":true,"include_reasoning":true,"chat_template_kwargs":{"thinking":true}},"deepseek-ai/deepseek-v3.1-terminus":{...}}
-//   REQUEST_MERGE_GLOBAL        JSON (merged for all models)
-//   // Optional: put extra vendor params under extra_body for providers that expect it there:
-//   EXTRA_BODY_BY_MODEL         JSON: {"deepseek-ai/deepseek-v3.1":{"chat_template_kwargs":{"thinking":true}}}
-//   EXTRA_BODY_GLOBAL           JSON
-//   THINK_OPEN_TAG              default "<think>"
-//   THINK_CLOSE_TAG             default "</think>"
-//   NIM_API_BASE                default "https://integrate.api.nvidia.com/v1"
-//   ENABLE_THINKING_MODE        "true" or "false" (default false) adds extra_body.chat_template_kwargs.thinking=true
 
 const express = require('express');
 const cors = require('cors');
@@ -76,12 +58,18 @@ function shouldShowReasoning(nimModelId) {
   return SHOW_REASONING_MODELS.some(token => id.includes(token));
 }
 
-// Defaults — override with MODEL_MAP_OVERRIDES
+// ---- Model mapping (added deepseek-v3.2 alias) ----
 const DEFAULT_MODEL_MAPPING = {
   'gpt-4o': 'deepseek-ai/deepseek-v3.1',
   'gpt-4o-mini': 'deepseek-ai/deepseek-v3.1-terminus',
   'gpt-4': 'deepseek-ai/deepseek-r1-0528',
-  'gpt-3.5-turbo': 'meta/llama-3.1-8b-instruct'
+  'gpt-3.5-turbo': 'meta/llama-3.1-8b-instruct',
+
+  // Added explicit aliases you can call directly:
+  'deepseek-v3.1': 'deepseek-ai/deepseek-v3.1',
+  'deepseek-v3.1-terminus': 'deepseek-ai/deepseek-v3.1-terminus',
+  'deepseek-v3.2': 'deepseek-ai/deepseek-v3.2',
+  'deepseek-r1': 'deepseek-ai/deepseek-r1-0528'
 };
 
 let MODEL_MAPPING = { ...DEFAULT_MODEL_MAPPING };
@@ -91,7 +79,7 @@ if (MODEL_MAP_OVERRIDES) {
   console.log('Loaded MODEL_MAP_OVERRIDES:', MODEL_MAPPING);
 }
 
-// For robustness: pick up alternative reasoning field names if provider uses them
+// ---- Reasoning extraction ----
 const REASONING_FIELDS = ['reasoning_content', 'reasoning', 'thoughts', 'thinking', 'chain_of_thought'];
 
 function extractReasoningFromDelta(delta) {
@@ -112,6 +100,87 @@ function extractReasoningFromMessage(msg) {
     if (typeof v === 'string' && v.length) return v;
   }
   return '';
+}
+
+// ---- Stream-safe upstream error handling (fixes circular JSON error) ----
+function isReadableStream(x) {
+  return x && typeof x === 'object' && typeof x.on === 'function' && typeof x.pipe === 'function';
+}
+
+function streamToString(stream, limitBytes = 2 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let total = 0;
+    let out = '';
+    stream.on('data', (chunk) => {
+      const s = chunk.toString('utf8');
+      total += Buffer.byteLength(s, 'utf8');
+      if (total > limitBytes) {
+        reject(new Error(`Upstream error body exceeded ${limitBytes} bytes`));
+        stream.destroy();
+        return;
+      }
+      out += s;
+    });
+    stream.on('end', () => resolve(out));
+    stream.on('error', reject);
+  });
+}
+
+async function sendUpstreamError(res, status, data, fallbackMessage = 'Upstream error') {
+  try {
+    if (isReadableStream(data)) {
+      const text = await streamToString(data);
+      try {
+        return res.status(status).json(JSON.parse(text));
+      } catch {
+        return res.status(status).json({
+          error: { message: text || fallbackMessage, type: 'upstream_error', code: status }
+        });
+      }
+    }
+
+    if (typeof data === 'string') {
+      try {
+        return res.status(status).json(JSON.parse(data));
+      } catch {
+        return res.status(status).json({
+          error: { message: data || fallbackMessage, type: 'upstream_error', code: status }
+        });
+      }
+    }
+
+    if (data && typeof data === 'object') {
+      // Assume already JSON-safe
+      return res.status(status).json(data);
+    }
+
+    return res.status(status).json({
+      error: { message: fallbackMessage, type: 'upstream_error', code: status }
+    });
+  } catch (e) {
+    return res.status(500).json({
+      error: { message: e?.message || 'Failed to forward upstream error', type: 'proxy_error', code: 500 }
+    });
+  }
+}
+
+// ---- Config fallback so v3.2 inherits v3.1 “thinking” settings automatically ----
+function getPerModelConfig(map, nimModel) {
+  if (!nimModel) return null;
+  if (map[nimModel]) return map[nimModel];
+
+  // If you didn’t add v3.2 explicitly, inherit v3.1’s config:
+  if (nimModel === 'deepseek-ai/deepseek-v3.2' && map['deepseek-ai/deepseek-v3.1']) {
+    return map['deepseek-ai/deepseek-v3.1'];
+  }
+
+  // Optional generic family key you can use in env:
+  // "deepseek-ai/deepseek-v3": { ... }
+  if (nimModel.startsWith('deepseek-ai/deepseek-v3') && map['deepseek-ai/deepseek-v3']) {
+    return map['deepseek-ai/deepseek-v3'];
+  }
+
+  return null;
 }
 
 app.get('/health', (req, res) => {
@@ -180,27 +249,26 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: !!stream
     };
 
-    // Optional thinking mode (generic hint — may be ignored by many models)
     if (ENABLE_THINKING_MODE) {
       nimRequest.extra_body = nimRequest.extra_body || {};
       nimRequest.extra_body.chat_template_kwargs = nimRequest.extra_body.chat_template_kwargs || {};
       nimRequest.extra_body.chat_template_kwargs.thinking = true;
     }
 
-    // Apply global and per-model top-level merges (experimental vendor hints)
+    // Apply global and per-model top-level merges
     if (REQUEST_MERGE_GLOBAL && Object.keys(REQUEST_MERGE_GLOBAL).length) {
       nimRequest = deepMerge(nimRequest, JSON.parse(JSON.stringify(REQUEST_MERGE_GLOBAL)));
     }
-    const reqMergeForModel = REQUEST_MERGE_BY_MODEL[nimModel];
+    const reqMergeForModel = getPerModelConfig(REQUEST_MERGE_BY_MODEL, nimModel);
     if (reqMergeForModel) {
       nimRequest = deepMerge(nimRequest, JSON.parse(JSON.stringify(reqMergeForModel)));
     }
 
-    // Apply extra_body merges (for providers that expect options there)
+    // Apply extra_body merges
     if (EXTRA_BODY_GLOBAL && Object.keys(EXTRA_BODY_GLOBAL).length) {
       nimRequest.extra_body = deepMerge(nimRequest.extra_body || {}, JSON.parse(JSON.stringify(EXTRA_BODY_GLOBAL)));
     }
-    const extraForModel = EXTRA_BODY_BY_MODEL[nimModel];
+    const extraForModel = getPerModelConfig(EXTRA_BODY_BY_MODEL, nimModel);
     if (extraForModel) {
       nimRequest.extra_body = deepMerge(nimRequest.extra_body || {}, JSON.parse(JSON.stringify(extraForModel)));
     }
@@ -208,13 +276,14 @@ app.post('/v1/chat/completions', async (req, res) => {
     const axiosConfig = {
       headers: { Authorization: `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
       responseType: stream ? 'stream' : 'json',
-      validateStatus: s => s < 500
+      validateStatus: s => s < 600 // IMPORTANT: don't throw on 5xx; we handle >=400 below
     };
 
     const upstream = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, axiosConfig);
 
     if (upstream.status >= 400) {
-      return res.status(upstream.status).json(upstream.data);
+      // IMPORTANT: upstream.data is a stream when responseType=stream
+      return await sendUpstreamError(res, upstream.status, upstream.data, 'Upstream returned an error');
     }
 
     const showReasoning = shouldShowReasoning(nimModel);
@@ -269,7 +338,6 @@ app.post('/v1/chat/completions', async (req, res) => {
               const r = extractReasoningFromDelta(delta);
               if (r) {
                 reasoningBuf += r;
-                // if this chunk was only reasoning, hold it until we have content
                 const onlyReasoning = !delta.content || delta.content.length === 0;
                 if (onlyReasoning) continue;
               }
@@ -278,11 +346,10 @@ app.post('/v1/chat/completions', async (req, res) => {
               }
             }
 
-            // always hide any leftover reasoning fields
             for (const f of REASONING_FIELDS) if (f in delta) delete delta[f];
-
             emit(data);
           } catch {
+            // pass through raw line if it's not JSON
             res.write(line + '\n');
           }
         }
@@ -322,17 +389,15 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     res.json(openaiResponse);
   } catch (error) {
-    const status = error.response?.status || 500;
-    const raw = error.response?.data;
-    const safeMsg =
-      (typeof raw === 'string' && raw) ||
-      (raw && typeof raw.error?.message === 'string' && raw.error.message) ||
-      (raw && typeof raw.message === 'string' && raw.message) ||
-      (typeof error.message === 'string' && error.message) ||
-      'Internal server error';
+    // If axios threw, try to forward upstream body safely too
+    if (error.response) {
+      const status = error.response.status || 500;
+      return await sendUpstreamError(res, status, error.response.data, error.message || 'Upstream request failed');
+    }
 
-    console.error('Proxy error:', { status, message: safeMsg });
-    res.status(status).json({ error: { message: safeMsg, type: 'invalid_request_error', code: status } });
+    const safeMsg = error?.message || 'Internal server error';
+    console.error('Proxy error:', { status: 500, message: safeMsg });
+    res.status(500).json({ error: { message: safeMsg, type: 'invalid_request_error', code: 500 } });
   }
 });
 
