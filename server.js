@@ -36,6 +36,18 @@ const REQUEST_MERGE_BY_MODEL = parseJSONEnv('REQUEST_MERGE_BY_MODEL') || {};
 const EXTRA_BODY_GLOBAL = parseJSONEnv('EXTRA_BODY_GLOBAL') || {};
 const EXTRA_BODY_BY_MODEL = parseJSONEnv('EXTRA_BODY_BY_MODEL') || {};
 
+function injectSystem(messages, text) {
+  const out = Array.isArray(messages) ? [...messages] : [];
+  // If first message is already system, prepend our instruction to it
+  if (out[0]?.role === 'system') {
+    out[0] = { ...out[0], content: `${text}\n\n${out[0].content || ''}`.trim() };
+    return out;
+  }
+  // Otherwise insert a system message at the front
+  return [{ role: 'system', content: text }, ...out];
+}
+
+
 function deepMerge(target, source) {
   if (!source || typeof source !== 'object') return target;
   for (const key of Object.keys(source)) {
