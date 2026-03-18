@@ -8,10 +8,17 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
+const NIM_API_BASE = String(process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1')
+  .trim()
+  .replace(/\/+$/, '');
+
 const NIM_API_KEY = process.env.NIM_API_KEY || '';
 
-const ENABLE_THINKING_MODE = String(process.env.ENABLE_THINKING_MODE || 'false').toLowerCase() === 'true';
+// Default ON if not set, so you don't have to keep adding env vars.
+const ENABLE_THINKING_MODE =
+  process.env.ENABLE_THINKING_MODE == null
+    ? true
+    : String(process.env.ENABLE_THINKING_MODE).toLowerCase() === 'true';
 
 const SHOW_REASONING_MODELS = (process.env.SHOW_REASONING_MODELS || 'deepseek,terminus,r1,glm')
   .split(',')
@@ -21,8 +28,16 @@ const SHOW_REASONING_MODELS = (process.env.SHOW_REASONING_MODELS || 'deepseek,te
 const THINK_OPEN = process.env.THINK_OPEN_TAG || '<think>';
 const THINK_CLOSE = process.env.THINK_CLOSE_TAG || '</think>';
 
-const GLM_UPSTREAM_ID = 'z-ai/glm5.0';
-const REASONING_FIELDS = ['reasoning_content', 'reasoning', 'thoughts', 'thinking', 'chain_of_thought'];
+// IMPORTANT: NVIDIA exposes z-ai/glm5 (not z-ai/glm5.0)
+const GLM_UPSTREAM_ID = 'z-ai/glm5';
+
+const REASONING_FIELDS = [
+  'reasoning_content',
+  'reasoning',
+  'thoughts',
+  'thinking',
+  'chain_of_thought'
+];
 
 function parseJSONEnv(name) {
   if (!process.env[name]) return null;
@@ -60,11 +75,14 @@ function normalizeGlmModelId(modelId) {
   const id = String(modelId || '').trim().toLowerCase();
 
   if (
-    id === 'glm4.7' ||
-    id === 'glm-4.7' ||
+    id === 'glm5' ||
+    id === 'glm-5' ||
     id === 'glm5.0' ||
     id === 'glm-5.0' ||
+    id === 'glm4.7' ||
+    id === 'glm-4.7' ||
     id === 'z-ai/glm4.7' ||
+    id === 'z-ai/glm5' ||
     id === 'z-ai/glm5.0'
   ) {
     return GLM_UPSTREAM_ID;
@@ -80,6 +98,7 @@ function normalizeModelMapOverrides(input) {
     const key = String(rawKey || '').trim();
     const lowerKey = key.toLowerCase();
 
+    // Don't re-publish old 4.7 aliases in /v1/models
     if (lowerKey === 'glm4.7' || lowerKey === 'glm-4.7') {
       continue;
     }
@@ -92,50 +111,23 @@ function normalizeModelMapOverrides(input) {
     out[key] = value;
   }
 
+  // Force the correct aliases
+  out['glm5'] = GLM_UPSTREAM_ID;
+  out['glm-5'] = GLM_UPSTREAM_ID;
   out['glm5.0'] = GLM_UPSTREAM_ID;
   out['glm-5.0'] = GLM_UPSTREAM_ID;
 
-  delete out['glm4.7'];
-  delete out['glm-4.7'];
-
   return out;
 }
 
-function normalizePerModelConfigKey(key) {
-  return normalizeGlmModelId(key);
-}
-
-function normalizeRequestMergeByModel(input) {
+function normalizePerModelConfigMap(input) {
   const out = {};
 
   for (const [rawKey, rawValue] of Object.entries(input || {})) {
-    const key = normalizePerModelConfigKey(rawKey);
+    const key = normalizeGlmModelId(rawKey);
     const value = cloneJSON(rawValue) || {};
     out[key] = deepMerge(out[key] || {}, value);
   }
-
-  out[GLM_UPSTREAM_ID] = deepMerge(out[GLM_UPSTREAM_ID] || {}, {
-    reasoning: { effort: 'medium' },
-    enable_reasoning: true,
-    include_reasoning: true,
-    chat_template_kwargs: { thinking: true }
-  });
-
-  return out;
-}
-
-function normalizeExtraBodyByModel(input) {
-  const out = {};
-
-  for (const [rawKey, rawValue] of Object.entries(input || {})) {
-    const key = normalizePerModelConfigKey(rawKey);
-    const value = cloneJSON(rawValue) || {};
-    out[key] = deepMerge(out[key] || {}, value);
-  }
-
-  out[GLM_UPSTREAM_ID] = deepMerge(out[GLM_UPSTREAM_ID] || {}, {
-    chat_template_kwargs: { thinking: true }
-  });
 
   return out;
 }
@@ -146,6 +138,7 @@ function shouldShowReasoning(nimModelId) {
   return SHOW_REASONING_MODELS.some(token => id.includes(token));
 }
 
+// For GLM, stream reasoning as normal content so UIs don't hide it.
 function reasoningAsContentModel(nimModelId) {
   const id = String(nimModelId || '').toLowerCase();
   return id.startsWith('z-ai/glm');
@@ -277,6 +270,8 @@ const DEFAULT_MODEL_MAPPING = {
   'deepseek-v3.1-terminus': 'deepseek-ai/deepseek-v3.1-terminus',
   'deepseek-r1': 'deepseek-ai/deepseek-r1-0528',
 
+  'glm5': GLM_UPSTREAM_ID,
+  'glm-5': GLM_UPSTREAM_ID,
   'glm5.0': GLM_UPSTREAM_ID,
   'glm-5.0': GLM_UPSTREAM_ID
 };
@@ -285,61 +280,76 @@ const DEFAULT_REQUEST_MERGE_GLOBAL = {
   top_k: -1
 };
 
-const DEFAULT_REQUEST_MERGE_BY_MODEL = {
-  'deepseek-ai/deepseek-v3.1': {
-    reasoning: { effort: 'medium' },
-    enable_reasoning: true,
-    include_reasoning: true,
-    chat_template_kwargs: { thinking: true }
-  },
-  'deepseek-ai/deepseek-v3.2': {
-    reasoning: { effort: 'medium' },
-    enable_reasoning: true,
-    include_reasoning: true,
-    chat_template_kwargs: { thinking: true }
-  },
-  'deepseek-ai/deepseek-v3.1-terminus': {
-    reasoning: { effort: 'medium' },
-    enable_reasoning: true,
-    include_reasoning: true,
-    chat_template_kwargs: { thinking: true }
-  },
-  [GLM_UPSTREAM_ID]: {
-    reasoning: { effort: 'medium' },
-    enable_reasoning: true,
-    include_reasoning: true,
-    chat_template_kwargs: { thinking: true }
-  }
-};
+const DEFAULT_REQUEST_MERGE_BY_MODEL = ENABLE_THINKING_MODE
+  ? {
+      'deepseek-ai/deepseek-v3.1': {
+        reasoning: { effort: 'medium' },
+        enable_reasoning: true,
+        include_reasoning: true,
+        chat_template_kwargs: { thinking: true }
+      },
+      'deepseek-ai/deepseek-v3.2': {
+        reasoning: { effort: 'medium' },
+        enable_reasoning: true,
+        include_reasoning: true,
+        chat_template_kwargs: { thinking: true }
+      },
+      'deepseek-ai/deepseek-v3.1-terminus': {
+        reasoning: { effort: 'medium' },
+        enable_reasoning: true,
+        include_reasoning: true,
+        chat_template_kwargs: { thinking: true }
+      },
+      'deepseek-ai/deepseek-r1-0528': {
+        reasoning: { effort: 'medium' },
+        enable_reasoning: true,
+        include_reasoning: true,
+        chat_template_kwargs: { thinking: true }
+      },
+      [GLM_UPSTREAM_ID]: {
+        reasoning: { effort: 'medium' },
+        enable_reasoning: true,
+        include_reasoning: true,
+        chat_template_kwargs: { thinking: true }
+      }
+    }
+  : {};
 
-const DEFAULT_EXTRA_BODY_BY_MODEL = {
-  'deepseek-ai/deepseek-v3.1': {
-    chat_template_kwargs: { thinking: true }
-  },
-  'deepseek-ai/deepseek-v3.2': {
-    chat_template_kwargs: { thinking: true }
-  },
-  'deepseek-ai/deepseek-v3.1-terminus': {
-    chat_template_kwargs: { thinking: true }
-  },
-  [GLM_UPSTREAM_ID]: {
-    chat_template_kwargs: { thinking: true }
-  }
-};
-
-const EXTRA_BODY_GLOBAL = parseJSONEnv('EXTRA_BODY_GLOBAL') || {};
+const DEFAULT_EXTRA_BODY_BY_MODEL = ENABLE_THINKING_MODE
+  ? {
+      'deepseek-ai/deepseek-v3.1': {
+        chat_template_kwargs: { thinking: true }
+      },
+      'deepseek-ai/deepseek-v3.2': {
+        chat_template_kwargs: { thinking: true }
+      },
+      'deepseek-ai/deepseek-v3.1-terminus': {
+        chat_template_kwargs: { thinking: true }
+      },
+      'deepseek-ai/deepseek-r1-0528': {
+        chat_template_kwargs: { thinking: true }
+      },
+      [GLM_UPSTREAM_ID]: {
+        chat_template_kwargs: { thinking: true }
+      }
+    }
+  : {};
 
 const REQUEST_MERGE_GLOBAL = deepMerge(
   cloneJSON(DEFAULT_REQUEST_MERGE_GLOBAL),
   parseJSONEnv('REQUEST_MERGE_GLOBAL') || {}
 );
 
-const REQUEST_MERGE_BY_MODEL = normalizeRequestMergeByModel(
-  deepMerge(cloneJSON(DEFAULT_REQUEST_MERGE_BY_MODEL), parseJSONEnv('REQUEST_MERGE_BY_MODEL') || {})
+const REQUEST_MERGE_BY_MODEL = deepMerge(
+  normalizePerModelConfigMap(DEFAULT_REQUEST_MERGE_BY_MODEL),
+  normalizePerModelConfigMap(parseJSONEnv('REQUEST_MERGE_BY_MODEL') || {})
 );
 
-const EXTRA_BODY_BY_MODEL = normalizeExtraBodyByModel(
-  deepMerge(cloneJSON(DEFAULT_EXTRA_BODY_BY_MODEL), parseJSONEnv('EXTRA_BODY_BY_MODEL') || {})
+const EXTRA_BODY_GLOBAL = parseJSONEnv('EXTRA_BODY_GLOBAL') || {};
+
+const EXTRA_BODY_BY_MODEL = deepMerge(
+  normalizePerModelConfigMap(DEFAULT_EXTRA_BODY_BY_MODEL),
+  normalizePerModelConfigMap(parseJSONEnv('EXTRA_BODY_BY_MODEL') || {})
 );
 
 let MODEL_MAPPING = { ...DEFAULT_MODEL_MAPPING };
@@ -424,7 +434,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: !!stream
     };
 
-    if (ENABLE_THINKING_MODE) {
+    if (ENABLE_THINKING_MODE && shouldShowReasoning(nimModel)) {
       nimRequest.extra_body = nimRequest.extra_body || {};
       nimRequest.extra_body.chat_template_kwargs = nimRequest.extra_body.chat_template_kwargs || {};
       nimRequest.extra_body.chat_template_kwargs.thinking = true;
