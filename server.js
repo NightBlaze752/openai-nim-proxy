@@ -196,6 +196,7 @@ function extractReasoningFromMessage(msg) {
       if (extracted) buf += extracted;
     }
   }
+
   return buf;
 }
 
@@ -294,13 +295,18 @@ function getPerModelConfig(map, nimModel) {
   return null;
 }
 
-const GLM_REASONING_BUNDLE = {
+const GLM_ROOT_REASONING_BUNDLE = {
   reasoning: { effort: 'medium' },
   enable_reasoning: true,
   include_reasoning: true,
-  enable_thinking: true,
-  thinking: { type: 'enabled' },
-  chat_template_kwargs: { thinking: true }
+  enable_thinking: true
+};
+
+const GLM_EXTRA_REASONING_BUNDLE = {
+  chat_template_kwargs: {
+    thinking: true,
+    enable_thinking: true
+  }
 };
 
 const DEFAULT_MODEL_MAPPING = {
@@ -329,28 +335,24 @@ const DEFAULT_REQUEST_MERGE_BY_MODEL = ENABLE_THINKING_MODE
       'deepseek-ai/deepseek-v3.1': {
         reasoning: { effort: 'medium' },
         enable_reasoning: true,
-        include_reasoning: true,
-        chat_template_kwargs: { thinking: true }
+        include_reasoning: true
       },
       'deepseek-ai/deepseek-v3.2': {
         reasoning: { effort: 'medium' },
         enable_reasoning: true,
-        include_reasoning: true,
-        chat_template_kwargs: { thinking: true }
+        include_reasoning: true
       },
       'deepseek-ai/deepseek-v3.1-terminus': {
         reasoning: { effort: 'medium' },
         enable_reasoning: true,
-        include_reasoning: true,
-        chat_template_kwargs: { thinking: true }
+        include_reasoning: true
       },
       'deepseek-ai/deepseek-r1-0528': {
         reasoning: { effort: 'medium' },
         enable_reasoning: true,
-        include_reasoning: true,
-        chat_template_kwargs: { thinking: true }
+        include_reasoning: true
       },
-      [GLM_UPSTREAM_ID]: cloneJSON(GLM_REASONING_BUNDLE)
+      [GLM_UPSTREAM_ID]: cloneJSON(GLM_ROOT_REASONING_BUNDLE)
     }
   : {};
 
@@ -368,7 +370,7 @@ const DEFAULT_EXTRA_BODY_BY_MODEL = ENABLE_THINKING_MODE
       'deepseek-ai/deepseek-r1-0528': {
         chat_template_kwargs: { thinking: true }
       },
-      [GLM_UPSTREAM_ID]: cloneJSON(GLM_REASONING_BUNDLE)
+      [GLM_UPSTREAM_ID]: cloneJSON(GLM_EXTRA_REASONING_BUNDLE)
     }
   : {};
 
@@ -476,6 +478,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       nimRequest.extra_body = nimRequest.extra_body || {};
       nimRequest.extra_body.chat_template_kwargs = nimRequest.extra_body.chat_template_kwargs || {};
       nimRequest.extra_body.chat_template_kwargs.thinking = true;
+
+      if (nimModel === GLM_UPSTREAM_ID) {
+        nimRequest.extra_body.chat_template_kwargs.enable_thinking = true;
+      }
     }
 
     if (REQUEST_MERGE_GLOBAL && Object.keys(REQUEST_MERGE_GLOBAL).length) {
@@ -497,8 +503,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
     if (ENABLE_THINKING_MODE && nimModel === GLM_UPSTREAM_ID) {
-      nimRequest = deepMerge(nimRequest, cloneJSON(GLM_REASONING_BUNDLE));
-      nimRequest.extra_body = deepMerge(nimRequest.extra_body || {}, cloneJSON(GLM_REASONING_BUNDLE));
+      nimRequest = deepMerge(nimRequest, cloneJSON(GLM_ROOT_REASONING_BUNDLE));
+      nimRequest.extra_body = deepMerge(nimRequest.extra_body || {}, cloneJSON(GLM_EXTRA_REASONING_BUNDLE));
     }
 
     if (DEBUG_REASONING && nimModel === GLM_UPSTREAM_ID) {
@@ -532,6 +538,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       let buffer = '';
       let reasoningBuf = '';
       let emittedReasoningBlock = false;
+      let loggedFirstChunk = false;
 
       function emit(obj) {
         res.write(`data: ${JSON.stringify(obj)}\n\n`);
@@ -579,6 +586,17 @@ app.post('/v1/chat/completions', async (req, res) => {
             const data = JSON.parse(payload);
             const delta = data?.choices?.[0]?.delta || {};
 
+            if (DEBUG_REASONING && nimModel === GLM_UPSTREAM_ID && !loggedFirstChunk) {
+              loggedFirstChunk = true;
+              console.log('GLM stream first chunk keys:', Object.keys(data || {}));
+              console.log('GLM stream first delta keys:', Object.keys(delta || {}));
+              console.log('GLM stream first chunk raw:', JSON.stringify(data, null, 2));
+            }
+
+            if (delta.content != null && typeof delta.content !== 'string') {
+              delta.content = textFromAny(delta.content);
+            }
+
             if (showReasoning) {
               const r = extractReasoningFromDelta(delta);
 
@@ -620,14 +638,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     const upstreamChoices = upstream.data?.choices || [];
 
     if (DEBUG_REASONING && nimModel === GLM_UPSTREAM_ID && upstreamChoices[0]?.message) {
-      console.log(
-        'GLM response message keys:',
-        Object.keys(upstreamChoices[0].message)
-      );
-      console.log(
-        'GLM raw first choice message:',
-        JSON.stringify(upstreamChoices[0].message, null, 2)
-      );
+      console.log('GLM response message keys:', Object.keys(upstreamChoices[0].message));
+      console.log('GLM raw first choice message:', JSON.stringify(upstreamChoices[0].message, null, 2));
     }
 
     const openaiResponse = {
