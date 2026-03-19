@@ -14,11 +14,13 @@ const NIM_API_BASE = String(process.env.NIM_API_BASE || 'https://integrate.api.n
 
 const NIM_API_KEY = process.env.NIM_API_KEY || '';
 
-// Default ON if not set, so you don't have to keep adding env vars.
 const ENABLE_THINKING_MODE =
   process.env.ENABLE_THINKING_MODE == null
     ? true
     : String(process.env.ENABLE_THINKING_MODE).toLowerCase() === 'true';
+
+const DEBUG_REASONING =
+  String(process.env.DEBUG_REASONING || 'false').toLowerCase() === 'true';
 
 const SHOW_REASONING_MODELS = (process.env.SHOW_REASONING_MODELS || 'deepseek,terminus,r1,glm')
   .split(',')
@@ -28,15 +30,18 @@ const SHOW_REASONING_MODELS = (process.env.SHOW_REASONING_MODELS || 'deepseek,te
 const THINK_OPEN = process.env.THINK_OPEN_TAG || '<think>';
 const THINK_CLOSE = process.env.THINK_CLOSE_TAG || '</think>';
 
-// IMPORTANT: NVIDIA exposes z-ai/glm5 (not z-ai/glm5.0)
 const GLM_UPSTREAM_ID = 'z-ai/glm5';
 
 const REASONING_FIELDS = [
   'reasoning_content',
   'reasoning',
+  'reasoning_text',
   'thoughts',
   'thinking',
-  'chain_of_thought'
+  'chain_of_thought',
+  'thought',
+  'analysis',
+  'reasoningText'
 ];
 
 function parseJSONEnv(name) {
@@ -71,6 +76,37 @@ function deepMerge(target, source) {
   return out;
 }
 
+function textFromAny(value) {
+  if (value == null) return '';
+
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+
+  if (Array.isArray(value)) {
+    return value.map(textFromAny).filter(Boolean).join('');
+  }
+
+  if (typeof value === 'object') {
+    if (typeof value.text === 'string') return value.text;
+    if (typeof value.content === 'string') return value.content;
+    if (Array.isArray(value.content)) return value.content.map(textFromAny).filter(Boolean).join('');
+    if (typeof value.reasoning_content === 'string') return value.reasoning_content;
+    if (typeof value.reasoning === 'string') return value.reasoning;
+    if (typeof value.reasoning_text === 'string') return value.reasoning_text;
+    if (typeof value.output_text === 'string') return value.output_text;
+    if (typeof value.value === 'string') return value.value;
+    if (typeof value.delta === 'string') return value.delta;
+
+    return Object.values(value).map(textFromAny).filter(Boolean).join('');
+  }
+
+  return '';
+}
+
+function contentToText(content) {
+  return textFromAny(content);
+}
+
 function normalizeGlmModelId(modelId) {
   const id = String(modelId || '').trim().toLowerCase();
 
@@ -96,12 +132,6 @@ function normalizeModelMapOverrides(input) {
 
   for (const [rawKey, rawValue] of Object.entries(input || {})) {
     const key = String(rawKey || '').trim();
-    const lowerKey = key.toLowerCase();
-
-    // Don't re-publish old 4.7 aliases in /v1/models
-    if (lowerKey === 'glm4.7' || lowerKey === 'glm-4.7') {
-      continue;
-    }
 
     let value = rawValue;
     if (typeof value === 'string') {
@@ -111,7 +141,6 @@ function normalizeModelMapOverrides(input) {
     out[key] = value;
   }
 
-  // Force the correct aliases
   out['glm5'] = GLM_UPSTREAM_ID;
   out['glm-5'] = GLM_UPSTREAM_ID;
   out['glm5.0'] = GLM_UPSTREAM_ID;
@@ -138,7 +167,6 @@ function shouldShowReasoning(nimModelId) {
   return SHOW_REASONING_MODELS.some(token => id.includes(token));
 }
 
-// For GLM, stream reasoning as normal content so UIs don't hide it.
 function reasoningAsContentModel(nimModelId) {
   const id = String(nimModelId || '').toLowerCase();
   return id.startsWith('z-ai/glm');
@@ -146,22 +174,29 @@ function reasoningAsContentModel(nimModelId) {
 
 function extractReasoningFromDelta(delta) {
   let buf = '';
+
   for (const f of REASONING_FIELDS) {
-    if (typeof delta[f] === 'string' && delta[f].length) {
-      buf += delta[f];
+    if (f in delta) {
+      const extracted = textFromAny(delta[f]);
+      if (extracted) buf += extracted;
       delete delta[f];
     }
   }
+
   return buf;
 }
 
 function extractReasoningFromMessage(msg) {
   if (!msg || typeof msg !== 'object') return '';
+
+  let buf = '';
   for (const f of REASONING_FIELDS) {
-    const v = msg[f];
-    if (typeof v === 'string' && v.length) return v;
+    if (f in msg) {
+      const extracted = textFromAny(msg[f]);
+      if (extracted) buf += extracted;
+    }
   }
-  return '';
+  return buf;
 }
 
 function isReadableStream(x) {
@@ -259,6 +294,15 @@ function getPerModelConfig(map, nimModel) {
   return null;
 }
 
+const GLM_REASONING_BUNDLE = {
+  reasoning: { effort: 'medium' },
+  enable_reasoning: true,
+  include_reasoning: true,
+  enable_thinking: true,
+  thinking: { type: 'enabled' },
+  chat_template_kwargs: { thinking: true }
+};
+
 const DEFAULT_MODEL_MAPPING = {
   'gpt-4o': 'deepseek-ai/deepseek-v3.1',
   'gpt-4o-mini': 'deepseek-ai/deepseek-v3.1-terminus',
@@ -306,12 +350,7 @@ const DEFAULT_REQUEST_MERGE_BY_MODEL = ENABLE_THINKING_MODE
         include_reasoning: true,
         chat_template_kwargs: { thinking: true }
       },
-      [GLM_UPSTREAM_ID]: {
-        reasoning: { effort: 'medium' },
-        enable_reasoning: true,
-        include_reasoning: true,
-        chat_template_kwargs: { thinking: true }
-      }
+      [GLM_UPSTREAM_ID]: cloneJSON(GLM_REASONING_BUNDLE)
     }
   : {};
 
@@ -329,9 +368,7 @@ const DEFAULT_EXTRA_BODY_BY_MODEL = ENABLE_THINKING_MODE
       'deepseek-ai/deepseek-r1-0528': {
         chat_template_kwargs: { thinking: true }
       },
-      [GLM_UPSTREAM_ID]: {
-        chat_template_kwargs: { thinking: true }
-      }
+      [GLM_UPSTREAM_ID]: cloneJSON(GLM_REASONING_BUNDLE)
     }
   : {};
 
@@ -365,6 +402,7 @@ app.get('/health', (req, res) => {
     thinking_mode: ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED',
     show_reasoning_allowlist: SHOW_REASONING_MODELS,
     glm_target: GLM_UPSTREAM_ID,
+    debug_reasoning: DEBUG_REASONING,
     has_nim_key: !!NIM_API_KEY
   });
 });
@@ -456,6 +494,15 @@ app.post('/v1/chat/completions', async (req, res) => {
     const extraForModel = getPerModelConfig(EXTRA_BODY_BY_MODEL, nimModel);
     if (extraForModel) {
       nimRequest.extra_body = deepMerge(nimRequest.extra_body || {}, cloneJSON(extraForModel));
+    }
+
+    if (ENABLE_THINKING_MODE && nimModel === GLM_UPSTREAM_ID) {
+      nimRequest = deepMerge(nimRequest, cloneJSON(GLM_REASONING_BUNDLE));
+      nimRequest.extra_body = deepMerge(nimRequest.extra_body || {}, cloneJSON(GLM_REASONING_BUNDLE));
+    }
+
+    if (DEBUG_REASONING && nimModel === GLM_UPSTREAM_ID) {
+      console.log('GLM request body:', JSON.stringify(nimRequest, null, 2));
     }
 
     const axiosConfig = {
@@ -570,14 +617,27 @@ app.post('/v1/chat/completions', async (req, res) => {
       return;
     }
 
+    const upstreamChoices = upstream.data?.choices || [];
+
+    if (DEBUG_REASONING && nimModel === GLM_UPSTREAM_ID && upstreamChoices[0]?.message) {
+      console.log(
+        'GLM response message keys:',
+        Object.keys(upstreamChoices[0].message)
+      );
+      console.log(
+        'GLM raw first choice message:',
+        JSON.stringify(upstreamChoices[0].message, null, 2)
+      );
+    }
+
     const openaiResponse = {
       id: `chatcmpl-${Date.now()}`,
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model: requestedModel,
-      choices: (upstream.data?.choices || []).map((choice, idx) => {
+      choices: upstreamChoices.map((choice, idx) => {
         const role = choice?.message?.role || 'assistant';
-        let content = choice?.message?.content || '';
+        let content = contentToText(choice?.message?.content || '');
 
         if (showReasoning) {
           const r = extractReasoningFromMessage(choice?.message);
@@ -645,4 +705,5 @@ app.listen(PORT, () => {
   console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Reasoning allowlist: ${SHOW_REASONING_MODELS.length ? SHOW_REASONING_MODELS.join(', ') : 'OFF'}`);
   console.log(`GLM target: ${GLM_UPSTREAM_ID}`);
+  console.log(`Debug reasoning: ${DEBUG_REASONING ? 'ON' : 'OFF'}`);
 });
