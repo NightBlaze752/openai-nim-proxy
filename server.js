@@ -645,5 +645,5 @@ app.listen(PORT, () => {
   console.log(`OpenAI->NIM Proxy running on port ${PORT}`);
   console.log(`Health: http://localhost:${PORT}/health`);
   console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Reasoning allowlist: ${SHOW_REASONING_MODELS.length ? SHOW_REASONING_MODELS.join(', ') : 'OFF'}`);
+  console.log(`Reasoning allowlist: ${SHOW_REASONING_MODELS.length ? SHOW_REASONING_MODELS.join(', ') : 'ON'}`);
 });
