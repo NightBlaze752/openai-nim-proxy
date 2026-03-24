@@ -82,31 +82,127 @@ function isDeepSeekThinkingModel(nimModelId) {
   );
 }
 
-function textFromAny(v) {
-  if (v == null) return '';
+function textFromAny(value) {
+  if (value == null) return '';
 
-  if (typeof v === 'string') return v;
-  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
 
-  if (Array.isArray(v)) {
-    return v.map(textFromAny).join('');
+  if (Array.isArray(value)) {
+    return value.map(textFromAny).join('');
   }
 
-  if (typeof v === 'object') {
-    if (typeof v.text === 'string') return v.text;
-    if (typeof v.content === 'string') return v.content;
-    if (Array.isArray(v.content)) return v.content.map(textFromAny).join('');
-    if (typeof v.reasoning_content === 'string') return v.reasoning_content;
-    if (typeof v.reasoning === 'string') return v.reasoning;
+  if (typeof value === 'object') {
+    if (typeof value.text === 'string') return value.text;
+    if (typeof value.content === 'string') return value.content;
+    if (Array.isArray(value.content)) return value.content.map(textFromAny).join('');
+    if (typeof value.reasoning_content === 'string') return value.reasoning_content;
+    if (typeof value.reasoning === 'string') return value.reasoning;
+    if (typeof value.output_text === 'string') return value.output_text;
 
     let buf = '';
-    for (const val of Object.values(v)) {
-      buf += textFromAny(val);
+    for (const v of Object.values(value)) {
+      buf += textFromAny(v);
     }
     return buf;
   }
 
   return '';
+}
+
+function isReadableStream(x) {
+  return x && typeof x === 'object' && typeof x.on === 'function' && typeof x.pipe === 'function';
+}
+
+function streamToString(stream, limitBytes = 2 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let total = 0;
+    let out = '';
+
+    stream.on('data', (chunk) => {
+      const s = chunk.toString('utf8');
+      total += Buffer.byteLength(s, 'utf8');
+
+      if (total > limitBytes) {
+        reject(new Error(`Upstream error body exceeded ${limitBytes} bytes`));
+        stream.destroy();
+        return;
+      }
+
+      out += s;
+    });
+
+    stream.on('end', () => resolve(out));
+    stream.on('error', reject);
+  });
+}
+
+async function sendUpstreamError(res, status, data, fallbackMessage = 'Upstream error') {
+  try {
+    if (isReadableStream(data)) {
+      const text = await streamToString(data);
+      try {
+        return res.status(status).json(JSON.parse(text));
+      } catch {
+        return res.status(status).json({
+          error: {
+            message: text || fallbackMessage,
+            type: 'upstream_error',
+            code: status
+          }
+        });
+      }
+    }
+
+    if (typeof data === 'string') {
+      try {
+        return res.status(status).json(JSON.parse(data));
+      } catch {
+        return res.status(status).json({
+          error: {
+            message: data || fallbackMessage,
+            type: 'upstream_error',
+            code: status
+          }
+        });
+      }
+    }
+
+    if (data && typeof data === 'object') {
+      return res.status(status).json(data);
+    }
+
+    return res.status(status).json({
+      error: {
+        message: fallbackMessage,
+        type: 'upstream_error',
+        code: status
+      }
+    });
+  } catch (e) {
+    return res.status(500).json({
+      error: {
+        message: e?.message || 'Failed to forward upstream error',
+        type: 'proxy_error',
+        code: 500
+      }
+    });
+  }
+}
+
+function getPerModelConfig(map, nimModel) {
+  if (!nimModel) return null;
+  if (map[nimModel]) return map[nimModel];
+
+  if (nimModel === 'deepseek-ai/deepseek-v3.2' && map['deepseek-ai/deepseek-v3.1']) {
+    return map['deepseek-ai/deepseek-v3.1'];
+  }
+
+  if (nimModel.startsWith('deepseek-ai/deepseek-v3') && map['deepseek-ai/deepseek-v3']) {
+    return map['deepseek-ai/deepseek-v3'];
+  }
+
+  return null;
 }
 
 const GLM_ROOT_REASONING_BUNDLE = {
@@ -120,22 +216,20 @@ const GLM_ROOT_REASONING_BUNDLE = {
 const GLM_EXTRA_REASONING_BUNDLE = {
   chat_template_kwargs: {
     thinking: true,
-    enable_thinking: true
+    enable_thinking: true,
+    clear_thinking: false
   }
 };
 
-// Defaults — override with MODEL_MAP_OVERRIDES
 const DEFAULT_MODEL_MAPPING = {
   'gpt-4o': 'deepseek-ai/deepseek-v3.1',
   'gpt-4o-mini': 'deepseek-ai/deepseek-v3.1-terminus',
   'gpt-3.5-turbo': 'meta/llama-3.1-8b-instruct',
 
-  // DeepSeek aliases
   'deepseek-v3.1': 'deepseek-ai/deepseek-v3.1',
   'deepseek-v3.2': 'deepseek-ai/deepseek-v3.2',
   'deepseek-v3.1-terminus': 'deepseek-ai/deepseek-v3.1-terminus',
 
-  // GLM aliases
   'glm5': GLM_UPSTREAM_ID,
   'glm-5': GLM_UPSTREAM_ID
 };
@@ -171,13 +265,22 @@ const DEFAULT_REQUEST_MERGE_BY_MODEL = ENABLE_THINKING_MODE
 const DEFAULT_EXTRA_BODY_BY_MODEL = ENABLE_THINKING_MODE
   ? {
       'deepseek-ai/deepseek-v3.1': {
-        chat_template_kwargs: { thinking: true }
+        chat_template_kwargs: {
+          thinking: true,
+          clear_thinking: false
+        }
       },
       'deepseek-ai/deepseek-v3.2': {
-        chat_template_kwargs: { thinking: true }
+        chat_template_kwargs: {
+          thinking: true,
+          clear_thinking: false
+        }
       },
       'deepseek-ai/deepseek-v3.1-terminus': {
-        chat_template_kwargs: { thinking: true }
+        chat_template_kwargs: {
+          thinking: true,
+          clear_thinking: false
+        }
       },
       [GLM_UPSTREAM_ID]: cloneJSON(GLM_EXTRA_REASONING_BUNDLE)
     }
@@ -228,89 +331,6 @@ function extractReasoningFromMessage(msg) {
   }
 
   return buf;
-}
-
-function isReadableStream(x) {
-  return x && typeof x === 'object' && typeof x.on === 'function' && typeof x.pipe === 'function';
-}
-
-function streamToString(stream, limitBytes = 2 * 1024 * 1024) {
-  return new Promise((resolve, reject) => {
-    let total = 0;
-    let out = '';
-
-    stream.on('data', (chunk) => {
-      const s = chunk.toString('utf8');
-      total += Buffer.byteLength(s, 'utf8');
-
-      if (total > limitBytes) {
-        reject(new Error(`Upstream error body exceeded ${limitBytes} bytes`));
-        stream.destroy();
-        return;
-      }
-
-      out += s;
-    });
-
-    stream.on('end', () => resolve(out));
-    stream.on('error', reject);
-  });
-}
-
-async function sendUpstreamError(res, status, data, fallbackMessage = 'Upstream error') {
-  try {
-    if (isReadableStream(data)) {
-      const text = await streamToString(data);
-      try {
-        return res.status(status).json(JSON.parse(text));
-      } catch {
-        return res.status(status).json({
-          error: { message: text || fallbackMessage, type: 'upstream_error', code: status }
-        });
-      }
-    }
-
-    if (typeof data === 'string') {
-      try {
-        return res.status(status).json(JSON.parse(data));
-      } catch {
-        return res.status(status).json({
-          error: { message: data || fallbackMessage, type: 'upstream_error', code: status }
-        });
-      }
-    }
-
-    if (data && typeof data === 'object') {
-      return res.status(status).json(data);
-    }
-
-    return res.status(status).json({
-      error: { message: fallbackMessage, type: 'upstream_error', code: status }
-    });
-  } catch (e) {
-    return res.status(500).json({
-      error: {
-        message: e?.message || 'Failed to forward upstream error',
-        type: 'proxy_error',
-        code: 500
-      }
-    });
-  }
-}
-
-function getPerModelConfig(map, nimModel) {
-  if (!nimModel) return null;
-  if (map[nimModel]) return map[nimModel];
-
-  if (nimModel === 'deepseek-ai/deepseek-v3.2' && map['deepseek-ai/deepseek-v3.1']) {
-    return map['deepseek-ai/deepseek-v3.1'];
-  }
-
-  if (nimModel.startsWith('deepseek-ai/deepseek-v3') && map['deepseek-ai/deepseek-v3']) {
-    return map['deepseek-ai/deepseek-v3'];
-  }
-
-  return null;
 }
 
 app.get('/health', (req, res) => {
@@ -381,18 +401,18 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: !!stream
     };
 
-    // Global thinking hint
     if (ENABLE_THINKING_MODE) {
       nimRequest.extra_body = nimRequest.extra_body || {};
-      nimRequest.extra_body.chat_template_kwargs = nimRequest.extra_body.chat_template_kwargs || {};
+      nimRequest.extra_body.chat_template_kwargs =
+        nimRequest.extra_body.chat_template_kwargs || {};
       nimRequest.extra_body.chat_template_kwargs.thinking = true;
+      nimRequest.extra_body.chat_template_kwargs.clear_thinking = false;
 
       if (nimModel === GLM_UPSTREAM_ID) {
         nimRequest.extra_body.chat_template_kwargs.enable_thinking = true;
       }
     }
 
-    // Top-level merges
     if (REQUEST_MERGE_GLOBAL && Object.keys(REQUEST_MERGE_GLOBAL).length) {
       nimRequest = deepMerge(nimRequest, cloneJSON(REQUEST_MERGE_GLOBAL));
     }
@@ -402,7 +422,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       nimRequest = deepMerge(nimRequest, cloneJSON(reqMergeForModel));
     }
 
-    // extra_body merges
     if (EXTRA_BODY_GLOBAL && Object.keys(EXTRA_BODY_GLOBAL).length) {
       nimRequest.extra_body = deepMerge(
         nimRequest.extra_body || {},
@@ -418,7 +437,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       );
     }
 
-    // Force DeepSeek thinking config after merges so env vars don’t accidentally disable it
     if (ENABLE_THINKING_MODE && isDeepSeekThinkingModel(nimModel)) {
       nimRequest = deepMerge(nimRequest, {
         reasoning: { effort: 'medium' },
@@ -427,11 +445,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
 
       nimRequest.extra_body = deepMerge(nimRequest.extra_body || {}, {
-        chat_template_kwargs: { thinking: true }
+        chat_template_kwargs: {
+          thinking: true,
+          clear_thinking: false
+        }
       });
     }
 
-    // Force GLM5 thinking config after merges
     if (ENABLE_THINKING_MODE && nimModel === GLM_UPSTREAM_ID) {
       nimRequest = deepMerge(nimRequest, cloneJSON(GLM_ROOT_REASONING_BUNDLE));
       nimRequest.extra_body = deepMerge(
@@ -460,7 +480,12 @@ app.post('/v1/chat/completions', async (req, res) => {
     );
 
     if (upstream.status >= 400) {
-      return await sendUpstreamError(res, upstream.status, upstream.data, 'Upstream returned an error');
+      return await sendUpstreamError(
+        res,
+        upstream.status,
+        upstream.data,
+        'Upstream returned an error'
+      );
     }
 
     const showReasoning = shouldShowReasoning(nimModel);
@@ -475,14 +500,16 @@ app.post('/v1/chat/completions', async (req, res) => {
       let buffer = '';
       let reasoningBuf = '';
       let emittedReasoningBlock = false;
-      let loggedFirstChunk = false;
+      let debugChunkCount = 0;
 
       function emit(obj) {
         res.write(`data: ${JSON.stringify(obj)}\n\n`);
       }
 
       function emitReasoningBlockIfNeeded() {
-        if (!showReasoning || glmReasoningAsContent || !reasoningBuf || emittedReasoningBlock) return;
+        if (!showReasoning || glmReasoningAsContent || !reasoningBuf || emittedReasoningBlock) {
+          return;
+        }
 
         const block = `${THINK_OPEN}\n${reasoningBuf}\n${THINK_CLOSE}\n\n`;
         const synthetic = {
@@ -517,19 +544,28 @@ app.post('/v1/chat/completions', async (req, res) => {
             const data = JSON.parse(payload);
             const delta = data?.choices?.[0]?.delta || {};
 
+            if (delta.content != null && typeof delta.content !== 'string') {
+              delta.content = textFromAny(delta.content);
+            }
+
             if (
               DEBUG_REASONING &&
               (isDeepSeekThinkingModel(nimModel) || nimModel === GLM_UPSTREAM_ID) &&
-              !loggedFirstChunk
+              debugChunkCount < 5
             ) {
-              loggedFirstChunk = true;
-              console.log('Reasoning stream first chunk keys:', Object.keys(data || {}));
-              console.log('Reasoning stream first delta keys:', Object.keys(delta || {}));
-              console.log('Reasoning stream first chunk raw:', JSON.stringify(data, null, 2));
+              debugChunkCount += 1;
+              console.log(`Reasoning stream chunk #${debugChunkCount}:`, JSON.stringify(data, null, 2));
             }
 
-            if (delta.content != null && typeof delta.content !== 'string') {
-              delta.content = textFromAny(delta.content);
+            if (DEBUG_REASONING) {
+              if (
+                delta.reasoning_content != null ||
+                delta.reasoning != null ||
+                delta.thinking != null ||
+                delta.analysis != null
+              ) {
+                console.log('Reasoning-bearing chunk:', JSON.stringify(data, null, 2));
+              }
             }
 
             if (showReasoning) {
@@ -637,7 +673,11 @@ app.post('/v1/chat/completions', async (req, res) => {
 
 app.use((req, res) => {
   res.status(404).json({
-    error: { message: `Endpoint ${req.path} not found`, type: 'invalid_request_error', code: 404 }
+    error: {
+      message: `Endpoint ${req.path} not found`,
+      type: 'invalid_request_error',
+      code: 404
+    }
   });
 });
 
@@ -645,5 +685,7 @@ app.listen(PORT, () => {
   console.log(`OpenAI->NIM Proxy running on port ${PORT}`);
   console.log(`Health: http://localhost:${PORT}/health`);
   console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Reasoning allowlist: ${SHOW_REASONING_MODELS.length ? SHOW_REASONING_MODELS.join(', ') : 'OFF'}`);
+  console.log(
+    `Reasoning allowlist: ${SHOW_REASONING_MODELS.length ? SHOW_REASONING_MODELS.join(', ') : 'OFF'}`
+  );
 });
