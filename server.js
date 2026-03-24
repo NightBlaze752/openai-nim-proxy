@@ -8,16 +8,26 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
+const NIM_API_BASE = String(
+  process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1'
+)
+  .trim()
+  .replace(/\/+$/, '');
+
 const NIM_API_KEY = process.env.NIM_API_KEY || '';
 
+// Default ON if not set
 const ENABLE_THINKING_MODE =
-  String(process.env.ENABLE_THINKING_MODE || 'false').toLowerCase() === 'true';
+  process.env.ENABLE_THINKING_MODE == null
+    ? true
+    : String(process.env.ENABLE_THINKING_MODE).toLowerCase() === 'true';
 
 const DEBUG_REASONING =
   String(process.env.DEBUG_REASONING || 'false').toLowerCase() === 'true';
 
-const SHOW_REASONING_MODELS = (process.env.SHOW_REASONING_MODELS || '')
+const SHOW_REASONING_MODELS = (
+  process.env.SHOW_REASONING_MODELS || 'deepseek,terminus,glm5'
+)
   .split(',')
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
@@ -26,6 +36,16 @@ const THINK_OPEN = process.env.THINK_OPEN_TAG || '<think>';
 const THINK_CLOSE = process.env.THINK_CLOSE_TAG || '</think>';
 
 const GLM_UPSTREAM_ID = 'z-ai/glm5';
+
+const REASONING_FIELDS = [
+  'reasoning_content',
+  'reasoning',
+  'thoughts',
+  'thinking',
+  'chain_of_thought',
+  'reasoning_text',
+  'analysis'
+];
 
 function parseJSONEnv(name) {
   if (!process.env[name]) return null;
@@ -62,15 +82,39 @@ function deepMerge(target = {}, source) {
   return target;
 }
 
+function normalizeGlmModelId(modelId) {
+  const raw = String(modelId || '').trim();
+  const id = raw.toLowerCase();
+
+  if (id === 'glm5' || id === 'glm-5' || id === GLM_UPSTREAM_ID.toLowerCase()) {
+    return GLM_UPSTREAM_ID;
+  }
+
+  return raw;
+}
+
+function normalizePerModelConfigMap(input) {
+  const out = {};
+
+  for (const [rawKey, rawValue] of Object.entries(input || {})) {
+    const key = normalizeGlmModelId(rawKey);
+    const value = cloneJSON(rawValue) || {};
+    out[key] = deepMerge(out[key] || {}, value);
+  }
+
+  return out;
+}
+
 function shouldShowReasoning(nimModelId) {
   if (!nimModelId || SHOW_REASONING_MODELS.length === 0) return false;
   const id = String(nimModelId).toLowerCase();
   return SHOW_REASONING_MODELS.some((token) => id.includes(token));
 }
 
+// For GLM, stream reasoning as normal content so UIs don’t hide it.
 function reasoningAsContentModel(nimModelId) {
   const id = String(nimModelId || '').toLowerCase();
-  return id === GLM_UPSTREAM_ID || id.includes(GLM_UPSTREAM_ID);
+  return id.startsWith('z-ai/glm');
 }
 
 function isDeepSeekThinkingModel(nimModelId) {
@@ -110,6 +154,32 @@ function textFromAny(value) {
   return '';
 }
 
+function extractReasoningFromDelta(delta) {
+  let buf = '';
+
+  for (const f of REASONING_FIELDS) {
+    const extracted = textFromAny(delta?.[f]);
+    if (extracted) {
+      buf += extracted;
+      delete delta[f];
+    }
+  }
+
+  return buf;
+}
+
+function extractReasoningFromMessage(msg) {
+  if (!msg || typeof msg !== 'object') return '';
+
+  let buf = '';
+  for (const f of REASONING_FIELDS) {
+    const extracted = textFromAny(msg[f]);
+    if (extracted) buf += extracted;
+  }
+
+  return buf;
+}
+
 function isReadableStream(x) {
   return x && typeof x === 'object' && typeof x.on === 'function' && typeof x.pipe === 'function';
 }
@@ -141,6 +211,7 @@ async function sendUpstreamError(res, status, data, fallbackMessage = 'Upstream 
   try {
     if (isReadableStream(data)) {
       const text = await streamToString(data);
+
       try {
         return res.status(status).json(JSON.parse(text));
       } catch {
@@ -210,7 +281,12 @@ const GLM_ROOT_REASONING_BUNDLE = {
   enable_reasoning: true,
   include_reasoning: true,
   enable_thinking: true,
-  thinking: { type: 'enabled' }
+  thinking: { type: 'enabled' },
+  chat_template_kwargs: {
+    thinking: true,
+    enable_thinking: true,
+    clear_thinking: false
+  }
 };
 
 const GLM_EXTRA_REASONING_BUNDLE = {
@@ -234,29 +310,38 @@ const DEFAULT_MODEL_MAPPING = {
   'glm-5': GLM_UPSTREAM_ID
 };
 
-let MODEL_MAPPING = { ...DEFAULT_MODEL_MAPPING };
-const MODEL_MAP_OVERRIDES = parseJSONEnv('MODEL_MAP_OVERRIDES');
-if (MODEL_MAP_OVERRIDES) {
-  MODEL_MAPPING = { ...MODEL_MAPPING, ...MODEL_MAP_OVERRIDES };
-  console.log('Loaded MODEL_MAP_OVERRIDES:', MODEL_MAPPING);
-}
+const DEFAULT_REQUEST_MERGE_GLOBAL = {
+  top_k: -1
+};
 
 const DEFAULT_REQUEST_MERGE_BY_MODEL = ENABLE_THINKING_MODE
   ? {
       'deepseek-ai/deepseek-v3.1': {
         reasoning: { effort: 'medium' },
         enable_reasoning: true,
-        include_reasoning: true
+        include_reasoning: true,
+        chat_template_kwargs: {
+          thinking: true,
+          clear_thinking: false
+        }
       },
       'deepseek-ai/deepseek-v3.2': {
         reasoning: { effort: 'medium' },
         enable_reasoning: true,
-        include_reasoning: true
+        include_reasoning: true,
+        chat_template_kwargs: {
+          thinking: true,
+          clear_thinking: false
+        }
       },
       'deepseek-ai/deepseek-v3.1-terminus': {
         reasoning: { effort: 'medium' },
         enable_reasoning: true,
-        include_reasoning: true
+        include_reasoning: true,
+        chat_template_kwargs: {
+          thinking: true,
+          clear_thinking: false
+        }
       },
       [GLM_UPSTREAM_ID]: cloneJSON(GLM_ROOT_REASONING_BUNDLE)
     }
@@ -286,52 +371,29 @@ const DEFAULT_EXTRA_BODY_BY_MODEL = ENABLE_THINKING_MODE
     }
   : {};
 
-const REQUEST_MERGE_GLOBAL = parseJSONEnv('REQUEST_MERGE_GLOBAL') || {};
+let MODEL_MAPPING = { ...DEFAULT_MODEL_MAPPING };
+const MODEL_MAP_OVERRIDES = parseJSONEnv('MODEL_MAP_OVERRIDES');
+if (MODEL_MAP_OVERRIDES) {
+  MODEL_MAPPING = { ...MODEL_MAPPING, ...MODEL_MAP_OVERRIDES };
+  console.log('Loaded MODEL_MAP_OVERRIDES:', MODEL_MAPPING);
+}
+
+const REQUEST_MERGE_GLOBAL = deepMerge(
+  cloneJSON(DEFAULT_REQUEST_MERGE_GLOBAL),
+  parseJSONEnv('REQUEST_MERGE_GLOBAL') || {}
+);
+
 const REQUEST_MERGE_BY_MODEL = deepMerge(
-  cloneJSON(DEFAULT_REQUEST_MERGE_BY_MODEL),
-  parseJSONEnv('REQUEST_MERGE_BY_MODEL') || {}
+  normalizePerModelConfigMap(DEFAULT_REQUEST_MERGE_BY_MODEL),
+  normalizePerModelConfigMap(parseJSONEnv('REQUEST_MERGE_BY_MODEL') || {})
 );
+
 const EXTRA_BODY_GLOBAL = parseJSONEnv('EXTRA_BODY_GLOBAL') || {};
+
 const EXTRA_BODY_BY_MODEL = deepMerge(
-  cloneJSON(DEFAULT_EXTRA_BODY_BY_MODEL),
-  parseJSONEnv('EXTRA_BODY_BY_MODEL') || {}
+  normalizePerModelConfigMap(DEFAULT_EXTRA_BODY_BY_MODEL),
+  normalizePerModelConfigMap(parseJSONEnv('EXTRA_BODY_BY_MODEL') || {})
 );
-
-const REASONING_FIELDS = [
-  'reasoning_content',
-  'reasoning',
-  'thoughts',
-  'thinking',
-  'chain_of_thought',
-  'reasoning_text',
-  'analysis'
-];
-
-function extractReasoningFromDelta(delta) {
-  let buf = '';
-
-  for (const f of REASONING_FIELDS) {
-    const extracted = textFromAny(delta?.[f]);
-    if (extracted) {
-      buf += extracted;
-      delete delta[f];
-    }
-  }
-
-  return buf;
-}
-
-function extractReasoningFromMessage(msg) {
-  if (!msg || typeof msg !== 'object') return '';
-
-  let buf = '';
-  for (const f of REASONING_FIELDS) {
-    const extracted = textFromAny(msg[f]);
-    if (extracted) buf += extracted;
-  }
-
-  return buf;
-}
 
 app.get('/health', (req, res) => {
   res.json({
@@ -371,6 +433,7 @@ app.get('/v1/models', async (req, res) => {
       'models error';
 
     console.error('Models passthrough error:', { status, message: msg });
+
     res.status(status).json({
       error: { message: msg, type: 'models_error', code: status }
     });
@@ -401,7 +464,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: !!stream
     };
 
-    if (ENABLE_THINKING_MODE) {
+    if (ENABLE_THINKING_MODE && shouldShowReasoning(nimModel)) {
+      // Root-level chat_template_kwargs (important for DeepSeek)
+      nimRequest.chat_template_kwargs = nimRequest.chat_template_kwargs || {};
+      nimRequest.chat_template_kwargs.thinking = true;
+      nimRequest.chat_template_kwargs.clear_thinking = false;
+
+      // extra_body chat_template_kwargs
       nimRequest.extra_body = nimRequest.extra_body || {};
       nimRequest.extra_body.chat_template_kwargs =
         nimRequest.extra_body.chat_template_kwargs || {};
@@ -409,6 +478,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       nimRequest.extra_body.chat_template_kwargs.clear_thinking = false;
 
       if (nimModel === GLM_UPSTREAM_ID) {
+        nimRequest.chat_template_kwargs.enable_thinking = true;
         nimRequest.extra_body.chat_template_kwargs.enable_thinking = true;
       }
     }
@@ -437,11 +507,16 @@ app.post('/v1/chat/completions', async (req, res) => {
       );
     }
 
+    // Force DeepSeek thinking at BOTH root and extra_body levels
     if (ENABLE_THINKING_MODE && isDeepSeekThinkingModel(nimModel)) {
       nimRequest = deepMerge(nimRequest, {
         reasoning: { effort: 'medium' },
         enable_reasoning: true,
-        include_reasoning: true
+        include_reasoning: true,
+        chat_template_kwargs: {
+          thinking: true,
+          clear_thinking: false
+        }
       });
 
       nimRequest.extra_body = deepMerge(nimRequest.extra_body || {}, {
@@ -452,11 +527,18 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
     }
 
+    // Force GLM5 thinking flags
     if (ENABLE_THINKING_MODE && nimModel === GLM_UPSTREAM_ID) {
       nimRequest = deepMerge(nimRequest, cloneJSON(GLM_ROOT_REASONING_BUNDLE));
       nimRequest.extra_body = deepMerge(
         nimRequest.extra_body || {},
-        cloneJSON(GLM_EXTRA_REASONING_BUNDLE)
+        {
+          chat_template_kwargs: {
+            thinking: true,
+            enable_thinking: true,
+            clear_thinking: false
+          }
+        }
       );
     }
 
@@ -665,6 +747,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     const safeMsg = error?.message || 'Internal server error';
     console.error('Proxy error:', { status: 500, message: safeMsg });
+
     res.status(500).json({
       error: { message: safeMsg, type: 'invalid_request_error', code: 500 }
     });
