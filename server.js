@@ -21,7 +21,7 @@ const ENABLE_THINKING_MODE =
 
 const DEBUG_REASONING = String(process.env.DEBUG_REASONING || 'false').toLowerCase() === 'true';
 
-// Avoid plain "deepseek" unless you want it to match every DeepSeek model.
+// Substring allowlist: if nim model id contains any token, we show reasoning
 const SHOW_REASONING_MODELS = (process.env.SHOW_REASONING_MODELS || 'glm,v4-pro,deepseek-v3.1,deepseek-v3.2,terminus,r1')
   .split(',')
   .map(s => s.trim().toLowerCase())
@@ -30,23 +30,20 @@ const SHOW_REASONING_MODELS = (process.env.SHOW_REASONING_MODELS || 'glm,v4-pro,
 const THINK_OPEN = process.env.THINK_OPEN_TAG || '<think>';
 const THINK_CLOSE = process.env.THINK_CLOSE_TAG || '</think>';
 
-// Models
-const GLM_UPSTREAM_ID = 'z-ai/glm-5.1';
+// ---- GLM 5.2 ----
+const GLM_UPSTREAM_ID = 'z-ai/glm-5.2';
 
-// GLM controls
+// default matches NVIDIA examples (clear_thinking false)
 const GLM_CLEAR_THINKING =
   process.env.GLM_CLEAR_THINKING == null
     ? false
     : String(process.env.GLM_CLEAR_THINKING).toLowerCase() === 'true';
 
-// If true: reasoning is mixed into content as it streams.
-// If false: reasoning is wrapped in <think>...</think> but still streamed progressively (no buffering stall).
+// If true: reasoning is mixed directly into content while streaming (always visible)
+// If false: reasoning is streamed inside <think>...</think> blocks (cleaner)
 const GLM_REASONING_AS_CONTENT = String(process.env.GLM_REASONING_AS_CONTENT || 'false').toLowerCase() === 'true';
 
-// DeepSeek v4-pro defaults
-const DEEPSEEK_V4_PRO_REASONING_EFFORT = String(process.env.DEEPSEEK_V4_PRO_REASONING_EFFORT || 'high').trim();
-
-// ---------- helpers ----------
+// ---------------- helpers ----------------
 function parseJSONEnv(name) {
   if (!process.env[name]) return null;
   try {
@@ -56,15 +53,12 @@ function parseJSONEnv(name) {
     return null;
   }
 }
-
 function cloneJSON(x) {
   return x == null ? x : JSON.parse(JSON.stringify(x));
 }
-
 function deepMerge(target, source) {
   const out = target && typeof target === 'object' ? target : {};
   if (!source || typeof source !== 'object') return out;
-
   for (const key of Object.keys(source)) {
     const srcVal = source[key];
     const tgtVal = out[key];
@@ -80,9 +74,6 @@ function deepMerge(target, source) {
 function isGlm(nimModelId) {
   return String(nimModelId || '').toLowerCase().startsWith('z-ai/glm');
 }
-function isDeepseekV4Pro(nimModelId) {
-  return String(nimModelId || '').toLowerCase() === 'deepseek-ai/deepseek-v4-pro';
-}
 
 function shouldShowReasoning(nimModelId) {
   if (!nimModelId || SHOW_REASONING_MODELS.length === 0) return false;
@@ -93,19 +84,21 @@ function shouldShowReasoning(nimModelId) {
 function normalizeMappedModelId(modelId) {
   const id = String(modelId || '').trim().toLowerCase();
 
-  // Any old GLM ids -> glm-5.1
+  // Any older GLM ids -> GLM-5.2
   if (
-    id === 'z-ai/glm5' || id === 'z-ai/glm4.7' ||
+    id === 'z-ai/glm5' || id === 'z-ai/glm4.7' || id === 'z-ai/glm-5.1' ||
     id === 'glm5' || id === 'glm-5' || id === 'glm5.0' || id === 'glm-5.0' ||
-    id === 'glm4.7' || id === 'glm-4.7'
+    id === 'glm4.7' || id === 'glm-4.7' ||
+    id === 'glm5.1' || id === 'glm-5.1'
   ) return GLM_UPSTREAM_ID;
 
-  if (id === 'z-ai/glm-5.1' || id === 'glm5.1' || id === 'glm-5.1') return GLM_UPSTREAM_ID;
+  // GLM-5.2 direct / alias
+  if (id === 'z-ai/glm-5.2' || id === 'glm5.2' || id === 'glm-5.2') return GLM_UPSTREAM_ID;
 
   return modelId;
 }
 
-// Reasoning fields seen across providers
+// Reasoning fields we try to extract
 const REASONING_FIELDS = [
   'reasoning_content',
   'reasoning',
@@ -142,7 +135,6 @@ function extractReasoningFromDelta(delta) {
 function isReadableStream(x) {
   return x && typeof x === 'object' && typeof x.on === 'function' && typeof x.pipe === 'function';
 }
-
 function streamToString(stream, limitBytes = 2 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let total = 0;
@@ -161,7 +153,6 @@ function streamToString(stream, limitBytes = 2 * 1024 * 1024) {
     stream.on('error', reject);
   });
 }
-
 async function sendUpstreamError(res, status, data, fallbackMessage = 'Upstream error') {
   try {
     if (isReadableStream(data)) {
@@ -182,7 +173,7 @@ async function sendUpstreamError(res, status, data, fallbackMessage = 'Upstream 
   }
 }
 
-// Strip params NVIDIA started rejecting for GLM
+// NVIDIA started rejecting these top-level keys for GLM, keep stripping them:
 function stripUnsupportedGlmTopLevelParams(nimRequest) {
   delete nimRequest.enable_reasoning;
   delete nimRequest.enable_thinking;
@@ -190,14 +181,18 @@ function stripUnsupportedGlmTopLevelParams(nimRequest) {
   delete nimRequest.reasoning;
 }
 
-// ---------- model mapping ----------
+// ---------------- model mapping ----------------
 const DEFAULT_MODEL_MAPPING = {
+  // DeepSeek convenience
   'deepseek-v4-pro': 'deepseek-ai/deepseek-v4-pro',
   'deepseek-v3.1': 'deepseek-ai/deepseek-v3.1',
   'deepseek-v3.2': 'deepseek-ai/deepseek-v3.2',
   'deepseek-v3.1-terminus': 'deepseek-ai/deepseek-v3.1-terminus',
   'deepseek-r1': 'deepseek-ai/deepseek-r1-0528',
 
+  // GLM convenience (map ALL older aliases to 5.2)
+  'glm5.2': GLM_UPSTREAM_ID,
+  'glm-5.2': GLM_UPSTREAM_ID,
   'glm5.1': GLM_UPSTREAM_ID,
   'glm-5.1': GLM_UPSTREAM_ID,
   'glm5': GLM_UPSTREAM_ID,
@@ -224,6 +219,7 @@ function getPerModelConfig(map, nimModel) {
   return map[nimModel] || null;
 }
 
+// ---------------- routes ----------------
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -233,7 +229,6 @@ app.get('/health', (req, res) => {
     glm_target: GLM_UPSTREAM_ID,
     glm_clear_thinking: GLM_CLEAR_THINKING,
     glm_reasoning_as_content: GLM_REASONING_AS_CONTENT,
-    deepseek_v4_pro_reasoning_effort: DEEPSEEK_V4_PRO_REASONING_EFFORT,
     debug_reasoning: DEBUG_REASONING,
     nim_api_base: NIM_API_BASE,
     has_nim_key: !!NIM_API_KEY
@@ -265,15 +260,18 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: !!stream
     };
 
-    // Client-provided knobs
+    // Forward client-provided extra_body and chat_template_kwargs
     if (body.extra_body && typeof body.extra_body === 'object') nimRequest.extra_body = cloneJSON(body.extra_body);
     if (body.chat_template_kwargs && typeof body.chat_template_kwargs === 'object') nimRequest.chat_template_kwargs = cloneJSON(body.chat_template_kwargs);
 
-    // Env merges
+    // Apply global merge
     nimRequest = deepMerge(nimRequest, cloneJSON(REQUEST_MERGE_GLOBAL));
+
+    // Per-model merge (top-level)
     const perModelMerge = getPerModelConfig(REQUEST_MERGE_BY_MODEL, nimModel);
     if (perModelMerge) nimRequest = deepMerge(nimRequest, cloneJSON(perModelMerge));
 
+    // Per-model extra_body merge
     const extraForModel = getPerModelConfig(EXTRA_BODY_BY_MODEL, nimModel);
     if (extraForModel) {
       nimRequest.extra_body = deepMerge(nimRequest.extra_body || {}, cloneJSON(extraForModel));
@@ -281,56 +279,49 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     const showReasoning = shouldShowReasoning(nimModel);
 
-    // ---- GLM 5.1: thinking only via chat_template_kwargs; strip rejected top-level fields
+    // ---- GLM 5.2: thinking via extra_body.chat_template_kwargs (as NVIDIA docs show),
+    //      but also hoist to top-level chat_template_kwargs for compatibility.
     if (ENABLE_THINKING_MODE && isGlm(nimModel)) {
-      if (nimRequest.extra_body?.chat_template_kwargs) {
-        nimRequest.chat_template_kwargs = deepMerge(nimRequest.chat_template_kwargs || {}, cloneJSON(nimRequest.extra_body.chat_template_kwargs));
-      }
-      nimRequest.chat_template_kwargs = nimRequest.chat_template_kwargs || {};
-      if (nimRequest.chat_template_kwargs.enable_thinking === undefined) nimRequest.chat_template_kwargs.enable_thinking = true;
-      if (nimRequest.chat_template_kwargs.clear_thinking === undefined) nimRequest.chat_template_kwargs.clear_thinking = GLM_CLEAR_THINKING;
-
-      stripUnsupportedGlmTopLevelParams(nimRequest);
-    }
-
-    // ---- DeepSeek v4-pro: inject reasoning_effort under extra_body.chat_template_kwargs
-    if (ENABLE_THINKING_MODE && isDeepseekV4Pro(nimModel)) {
       nimRequest.extra_body = nimRequest.extra_body || {};
       nimRequest.extra_body.chat_template_kwargs = nimRequest.extra_body.chat_template_kwargs || {};
 
-      if (nimRequest.extra_body.chat_template_kwargs.thinking === undefined) {
-        nimRequest.extra_body.chat_template_kwargs.thinking = true;
+      if (nimRequest.extra_body.chat_template_kwargs.enable_thinking === undefined) {
+        nimRequest.extra_body.chat_template_kwargs.enable_thinking = true;
       }
-      if (nimRequest.extra_body.chat_template_kwargs.thinking !== false) {
-        if (nimRequest.extra_body.chat_template_kwargs.reasoning_effort === undefined) {
-          nimRequest.extra_body.chat_template_kwargs.reasoning_effort = DEEPSEEK_V4_PRO_REASONING_EFFORT;
-        }
+      if (nimRequest.extra_body.chat_template_kwargs.clear_thinking === undefined) {
+        nimRequest.extra_body.chat_template_kwargs.clear_thinking = GLM_CLEAR_THINKING;
       }
+
+      // Hoist to top-level as well (safe)
+      nimRequest.chat_template_kwargs = deepMerge(
+        nimRequest.chat_template_kwargs || {},
+        cloneJSON(nimRequest.extra_body.chat_template_kwargs)
+      );
+
+      // Avoid NVIDIA validation errors
+      stripUnsupportedGlmTopLevelParams(nimRequest);
     }
 
-    if (DEBUG_REASONING) {
-      console.log('Upstream model:', nimModel);
-      console.log('Upstream request:', JSON.stringify(nimRequest, null, 2));
+    if (DEBUG_REASONING && isGlm(nimModel)) {
+      console.log('GLM request to upstream:', JSON.stringify(nimRequest, null, 2));
     }
 
-    const axiosConfig = {
+    const upstream = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
       headers: {
         Authorization: `Bearer ${NIM_API_KEY}`,
         'Content-Type': 'application/json',
         Accept: 'application/json'
       },
       responseType: stream ? 'stream' : 'json',
-      timeout: 0, // don’t impose a client-side timeout
+      timeout: 0,
       validateStatus: s => s < 600
-    };
-
-    const upstream = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, axiosConfig);
+    });
 
     if (upstream.status >= 400) {
       return await sendUpstreamError(res, upstream.status, upstream.data, 'Upstream returned an error');
     }
 
-    // STREAMING: stream reasoning immediately (no long buffering stall)
+    // ---- STREAMING: stream reasoning immediately (no long buffering stalls)
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -340,8 +331,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       let buffer = '';
       let thinkOpenSent = false;
       let thinkClosedSent = false;
-
-      const glmReasoningAsContent = showReasoning && isGlm(nimModel) && GLM_REASONING_AS_CONTENT;
 
       function emit(obj) {
         res.write(`data: ${JSON.stringify(obj)}\n\n`);
@@ -357,8 +346,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           const payload = line.slice(5).trim();
 
           if (payload === '[DONE]') {
-            // close think block if it was opened
-            if (showReasoning && thinkOpenSent && !thinkClosedSent && !glmReasoningAsContent) {
+            if (showReasoning && thinkOpenSent && !thinkClosedSent && !GLM_REASONING_AS_CONTENT) {
               emit({
                 id: `chunk-${Date.now()}`,
                 object: 'chat.completion.chunk',
@@ -376,41 +364,39 @@ app.post('/v1/chat/completions', async (req, res) => {
             const data = JSON.parse(payload);
             const delta = data?.choices?.[0]?.delta || {};
 
-            const originalContent = typeof delta.content === 'string' ? delta.content : (delta.content == null ? '' : textFromAny(delta.content));
-            let r = '';
+            const originalContent = typeof delta.content === 'string'
+              ? delta.content
+              : (delta.content == null ? '' : textFromAny(delta.content));
 
-            if (showReasoning) {
-              r = extractReasoningFromDelta(delta);
-            }
+            let reasoningText = '';
+            if (showReasoning) reasoningText = extractReasoningFromDelta(delta);
 
-            // If we got reasoning, stream it right away
-            if (showReasoning && r) {
-              if (glmReasoningAsContent) {
-                delta.content = (originalContent || '') + r;
+            if (showReasoning && reasoningText) {
+              if (isGlm(nimModel) && GLM_REASONING_AS_CONTENT) {
+                delta.content = (originalContent || '') + reasoningText;
               } else {
-                // progressive <think> stream
+                // stream <think> progressively
                 let out = '';
                 if (!thinkOpenSent) {
                   out += `${THINK_OPEN}\n`;
                   thinkOpenSent = true;
                 }
 
-                // If content is present in the same chunk, close the think block before content
                 if (originalContent) {
                   if (!thinkClosedSent) {
-                    out += r + `\n${THINK_CLOSE}\n\n` + originalContent;
+                    out += reasoningText + `\n${THINK_CLOSE}\n\n` + originalContent;
                     thinkClosedSent = true;
                   } else {
-                    out += r + originalContent;
+                    out += reasoningText + originalContent;
                   }
                 } else {
-                  out += r;
+                  out += reasoningText;
                 }
                 delta.content = out;
               }
             } else {
-              // No reasoning in this chunk. If this is the first real content after thinking, close block first.
-              if (showReasoning && thinkOpenSent && !thinkClosedSent && originalContent) {
+              // no reasoning in this chunk
+              if (showReasoning && thinkOpenSent && !thinkClosedSent && originalContent && !(isGlm(nimModel) && GLM_REASONING_AS_CONTENT)) {
                 delta.content = `\n${THINK_CLOSE}\n\n` + originalContent;
                 thinkClosedSent = true;
               } else {
@@ -430,7 +416,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       return;
     }
 
-    // NON-STREAM passthrough (simple)
+    // Non-streaming passthrough
     return res.json(upstream.data);
   } catch (error) {
     if (error.response) {
@@ -443,4 +429,5 @@ app.post('/v1/chat/completions', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`OpenAI->NIM Proxy running on port ${PORT}`);
+  console.log(`GLM target: ${GLM_UPSTREAM_ID}`);
 });
